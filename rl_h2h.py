@@ -1346,9 +1346,16 @@ def render_session_html(s: SessionStats) -> str:
     legend = ""
     if show_legend:
         legend = (
-            "<div style='height:8px;font-size:1px;line-height:1px;'>&nbsp;</div>"
-            f"<div style='color:{C_MUTED};font-size:8pt;letter-spacing:0.04em;'>"
-            "Format: <b>session</b> | yours</div>"
+            "<table cellpadding='0' cellspacing='0' width='100%'>"
+            "<tr><td height='10'>&nbsp;</td></tr></table>"
+            "<table width='100%' cellspacing='0' cellpadding='0' "
+            "style='border-collapse:collapse;'>"
+            "<tr>"
+            f"<td align='left'  style='color:{C_MUTED};font-size:8pt;"
+            "letter-spacing:0.02em;'>Format</td>"
+            f"<td align='right' style='color:{C_MUTED};font-size:8pt;"
+            "letter-spacing:0.02em;'><b>session</b> | yours</td>"
+            "</tr></table>"
         )
     return (
         header
@@ -1455,6 +1462,47 @@ class MatchStats:
                     self.demos_self += 1
                 if self._is_self(sec_name):
                     self.demoed_self += 1
+
+
+def _first_keyboard_label(keys: list) -> Optional[str]:
+    """Pick the friendliest key label from a hotkeys list — prefer keyboard names
+    over gamepad bindings (more recognizable in a footer hint)."""
+    if not keys:
+        return None
+    for k in keys:
+        if not k.startswith("pad_"):
+            return k.upper()
+    # All gamepad — render the first as-is.
+    return keys[0]
+
+
+def hotkey_hint_html(cfg: dict, expanded: bool) -> str:
+    """Footer for the H2H overlay showing the F11/F12 (or whatever's configured)
+    hotkeys: action label on the left, session label on the right. Returns ''
+    when neither hotkey is bound."""
+    expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
+    session_label = _first_keyboard_label(cfg.get("session_hotkeys") or [])
+    left = ""
+    right = ""
+    if expand_label:
+        verb = "collapse" if expanded else "expand"
+        left = f"<b>{expand_label}</b> {verb}"
+    if session_label:
+        right = f"<b>{session_label}</b> session"
+    if not left and not right:
+        return ""
+    return (
+        "<table cellpadding='0' cellspacing='0' width='100%'>"
+        "<tr><td height='12'>&nbsp;</td></tr></table>"
+        "<table width='100%' cellspacing='0' cellpadding='0' "
+        "style='border-collapse:collapse;'>"
+        "<tr>"
+        f"<td align='left'  style='color:{C_MUTED};font-size:8pt;"
+        f"letter-spacing:0.02em;'>{left}</td>"
+        f"<td align='right' style='color:{C_MUTED};font-size:8pt;"
+        f"letter-spacing:0.02em;'>{right}</td>"
+        "</tr></table>"
+    )
 
 
 def make_tray_icon() -> QIcon:
@@ -1593,6 +1641,7 @@ def main():
         if state["session_held"]:
             overlay.set_html(render_session_html(session))
         elif state["h2h_held"] and state["in_match"]:
+            hint = hotkey_hint_html(cfg, state["h2h_expanded"])
             if state["h2h_expanded"]:
                 # Qt RichText doesn't reliably honor `height` on `<div>` (block size
                 # follows content) and `bgcolor` cells ignore `height='1'` (clamped to a
@@ -1602,9 +1651,11 @@ def main():
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
                     "<tr><td height='28'>&nbsp;</td></tr></table>"
                 )
-                overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
+                overlay.set_html(
+                    state["h2h_html"] + spacer + render_session_html(session) + hint
+                )
             else:
-                overlay.set_html(state["h2h_html"])
+                overlay.set_html(state["h2h_html"] + hint)
         elif state["summary_visible"]:
             overlay.set_html(state["summary_html"])
         else:
