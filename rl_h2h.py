@@ -155,9 +155,11 @@ DEFAULT_CONFIG = {
         "Gamepad bindings require: pip install inputs",
         "Note: stock RL maps D-pad directions to quickchat. To avoid sending a quickchat",
         "      every time you check the overlay, use 'pad_back' on controller.",
-        "require_rl_focus: only show the overlay when Rocket League has focus (Windows).",
-        "self_player_id:   auto-filled after your first 1v1 match — used to hide your own",
-        "                  W/L stat row. Set manually if you only play 2v2/3v3.",
+        "require_rl_focus:   only show the overlay when Rocket League has focus (Windows).",
+        "show_match_summary: flash a 5-second result + per-match stats card when a match",
+        "                    ends. Set to false to disable.",
+        "self_player_id:     auto-filled after your first 1v1 match — used to hide your own",
+        "                    W/L stat row. Set manually if you only play 2v2/3v3.",
         "position: top-left | top-center | top-right | bottom-left | bottom-right"
     ],
     "host": "127.0.0.1",
@@ -165,6 +167,7 @@ DEFAULT_CONFIG = {
     "hotkeys": ["tab", "pad_back"],
     "session_hotkeys": ["f12"],
     "require_rl_focus": True,
+    "show_match_summary": True,
     "self_player_id": None,
     "position": "top-right",
     "margin": 24,
@@ -280,6 +283,32 @@ def append_match(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+def load_recent_results(limit: int = 5) -> list:
+    """Read the last `limit` W/L results from matches.jsonl (oldest → newest)."""
+    if not MATCHES_PATH.exists():
+        return []
+    try:
+        with MATCHES_PATH.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out: list[str] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        res = rec.get("result")
+        if res in ("W", "L"):
+            out.append(res)
+            if len(out) >= limit:
+                break
+    return list(reversed(out))
+
+
 def update_players_cache(players: dict, match: dict) -> None:
     my_team = match["myTeam"]
     i_won = match["winner"] == my_team
@@ -295,15 +324,14 @@ def update_players_cache(players: dict, match: dict) -> None:
             "name": p["name"],
             "aliases": [p["name"]],
             BUCKET_VS:   {"wins": 0, "losses": 0, "lastSeenAt": None,
-                          "lastResult": None, "lastScore": None, "recent": []},
+                          "lastResult": None, "lastScore": None},
             BUCKET_WITH: {"wins": 0, "losses": 0, "lastSeenAt": None,
-                          "lastResult": None, "lastScore": None, "recent": []},
+                          "lastResult": None, "lastScore": None},
         })
         rec["name"] = p["name"]
         if p["name"] not in rec["aliases"]:
             rec["aliases"].append(p["name"])
         bucket = rec[BUCKET_WITH if p["team"] == my_team else BUCKET_VS]
-        bucket.setdefault("recent", [])  # back-compat for older players.json entries
         if i_won:
             bucket["wins"] += 1
         else:
@@ -311,8 +339,6 @@ def update_players_cache(players: dict, match: dict) -> None:
         bucket["lastSeenAt"] = when
         bucket["lastResult"] = result_letter
         bucket["lastScore"] = my_pov
-        bucket["recent"].append(result_letter)
-        bucket["recent"] = bucket["recent"][-5:]
 
 
 class StatsClient(QObject):
@@ -928,8 +954,7 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             f"letter-spacing:0.14em;border:1px solid {C_FAINT};"
             "padding:1px 6px;'>NEW</span>"
         )
-        sub_left = ""
-        sub_right = ""
+        sub = ""
     else:
         b = rec[bucket]
         stat_cell = (
@@ -939,32 +964,29 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             "</span>"
         )
         when = humanize_when(b["lastSeenAt"])
+        res = b["lastResult"]
         last_score = b.get("lastScore")
-        # Left of sub-row: freshness (+ score of last match if known).
-        sub_left = ""
-        if when:
+        if when and res:
+            res_color = C_WIN if res == "W" else C_LOSS
             score_part = ""
             if isinstance(last_score, list) and len(last_score) == 2:
                 score_part = (
-                    f"&nbsp;<span style='font-family:Consolas,\"SF Mono\",monospace;'>"
-                    f"{last_score[0]}&ndash;{last_score[1]}</span>"
+                    f"&nbsp;<span style='color:{C_MUTED};"
+                    "font-family:Consolas,\"SF Mono\",monospace;'>"
+                    f"({last_score[0]}&ndash;{last_score[1]})</span>"
                 )
-            sub_left = (
+            sub = (
                 f"<span style='color:{C_MUTED};font-size:8pt;'>"
-                f"{when}{score_part}</span>"
+                f"{when}&nbsp;<span style='color:{res_color};font-weight:700;'>{res}</span>"
+                f"{score_part}"
+                "</span>"
             )
-        # Right of sub-row: last 5 W/L pips, oldest → newest, lime/red.
-        sub_right = _recent_pips(b.get("recent") or [])
+        else:
+            sub = ""
 
-    sub_row = ""
-    if sub_left or sub_right:
-        sub_row = (
-            "<tr>"
-            f"<td align='left' style='padding:0 0 2px 0;'>{sub_left}</td>"
-            f"<td align='right' style='padding:0 0 2px 0;white-space:nowrap;'>"
-            f"{sub_right}</td>"
-            "</tr>"
-        )
+    sub_row = (
+        f"<tr><td colspan='2' style='padding:0 0 2px 0;'>{sub}</td></tr>" if sub else ""
+    )
     return (
         "<table width='100%' cellspacing='0' cellpadding='0' "
         "style='border-collapse:collapse;margin:0;'>"
@@ -1075,6 +1097,7 @@ class SessionStats:
         self.win_streak = 0
         self.loss_streak = 0
         self.best_win_streak = 0
+        self.recent: list[str] = []  # last 5 results (W/L), persisted via matches.jsonl
         self.goals_for = 0
         self.goals_against = 0
         self.crossbars = 0
@@ -1159,6 +1182,8 @@ class SessionStats:
             self.losses += 1
             self.loss_streak += 1
             self.win_streak = 0
+        self.recent.append("W" if i_won else "L")
+        self.recent = self.recent[-5:]
         score = payload.get("score")
         if isinstance(score, list) and len(score) == 2:
             mt = payload["myTeam"]
@@ -1273,6 +1298,7 @@ def render_session_html(s: SessionStats) -> str:
             (f"<span style='color:{C_WIN};font-weight:700;'>W{s.best_win_streak}</span>"
              if s.best_win_streak else em_dash),
         ),
+        _stat_row("Recent", _recent_pips(s.recent) if s.recent else em_dash),
     ]
     play_rows = [
         _stat_row("Saves",     _pair_int_self(saves_s, saves_t)),
@@ -1323,8 +1349,65 @@ def render_session_html(s: SessionStats) -> str:
     )
 
 
-def render_summary_html(payload: dict) -> str:
-    """Auto-popup card flashed for ~5s when a match ends."""
+class MatchStats:
+    """Per-match aggregator. Reset on match_initialized, snapshot on match_ended."""
+
+    def __init__(self, self_name: Optional[str] = None):
+        self.self_name = self_name
+        self.shots = 0
+        self.saves = 0
+        self.demos_given = 0
+        self.demos_received = 0
+        self.crossbars = 0
+        self.max_goal_speed = 0.0
+        self.max_ball_speed = 0.0
+        self.max_impact_force = 0.0
+        self.fastest_goal_time: Optional[float] = None
+
+    def _is_self(self, name) -> bool:
+        return bool(name) and name == self.self_name
+
+    def on_event(self, event: str, data: dict) -> None:
+        if event == "GoalScored":
+            sp = data.get("GoalSpeed")
+            if isinstance(sp, (int, float)):
+                self.max_goal_speed = max(self.max_goal_speed, float(sp))
+            scorer = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
+            if self._is_self(scorer):
+                gt = data.get("GoalTime")
+                if isinstance(gt, (int, float)) and gt > 0:
+                    if self.fastest_goal_time is None or gt < self.fastest_goal_time:
+                        self.fastest_goal_time = float(gt)
+        elif event == "BallHit":
+            ball = data.get("Ball")
+            if isinstance(ball, dict):
+                sp = ball.get("PostHitSpeed")
+                if isinstance(sp, (int, float)):
+                    self.max_ball_speed = max(self.max_ball_speed, float(sp))
+        elif event == "CrossbarHit":
+            self.crossbars += 1
+            ifo = data.get("ImpactForce")
+            if isinstance(ifo, (int, float)):
+                self.max_impact_force = max(self.max_impact_force, float(ifo))
+        elif event == "StatfeedEvent":
+            ev = data.get("EventName")
+            main = data.get("MainTarget") or {}
+            sec = data.get("SecondaryTarget") or {}
+            main_name = main.get("Name") if isinstance(main, dict) else None
+            sec_name = sec.get("Name") if isinstance(sec, dict) else None
+            if self._is_self(main_name):
+                if ev == "Save":
+                    self.saves += 1
+                elif ev == "Shot":
+                    self.shots += 1
+                elif ev == "Demolish":
+                    self.demos_given += 1
+            if self._is_self(sec_name) and ev == "Demolish":
+                self.demos_received += 1
+
+
+def render_summary_html(payload: dict, ms: "MatchStats") -> str:
+    """Auto-popup card flashed for ~5s when a match ends. Result + score + per-match stats."""
     my_team = payload.get("myTeam")
     winner = payload.get("winner")
     i_won = winner == my_team
@@ -1342,16 +1425,7 @@ def render_summary_html(payload: dict) -> str:
     else:
         score_html = ""
 
-    arena_label = pretty_arena(payload.get("arena") or "")
-    arena_html = ""
-    if arena_label:
-        a = arena_label if len(arena_label) <= 22 else arena_label[:21] + "…"
-        arena_html = (
-            f"<div style='color:{C_MUTED};font-size:8pt;font-weight:500;"
-            f"letter-spacing:0.10em;margin-top:6px;'>{a.upper()}</div>"
-        )
-
-    return (
+    header = (
         "<table width='100%' cellspacing='0' cellpadding='0' "
         "style='border-collapse:collapse;'>"
         "<tr>"
@@ -1360,8 +1434,38 @@ def render_summary_html(payload: dict) -> str:
         f"<td align='right'>{score_html}</td>"
         "</tr>"
         "</table>"
-        + arena_html
     )
+
+    play_rows = []
+    if ms.saves:          play_rows.append(_stat_row("Saves",     str(ms.saves)))
+    if ms.shots:          play_rows.append(_stat_row("Shots",     str(ms.shots)))
+    if ms.demos_given:    play_rows.append(_stat_row("Demos",     str(ms.demos_given)))
+    if ms.demos_received: play_rows.append(_stat_row("Demoed",    str(ms.demos_received)))
+    if ms.crossbars:      play_rows.append(_stat_row("Crossbars", str(ms.crossbars)))
+
+    fun_rows = []
+    if ms.max_goal_speed > 0:
+        fun_rows.append(_stat_row("Max goal speed",   str(int(ms.max_goal_speed))))
+    if ms.max_ball_speed > 0:
+        fun_rows.append(_stat_row("Max ball speed",   str(int(ms.max_ball_speed))))
+    if ms.max_impact_force > 0:
+        fun_rows.append(_stat_row("Hardest crossbar", str(int(ms.max_impact_force))))
+    if ms.fastest_goal_time is not None:
+        fun_rows.append(_stat_row("Fastest goal",     f"{ms.fastest_goal_time:.1f}s"))
+
+    body = ""
+    if play_rows:
+        body += _stat_section("PLAY", play_rows)
+    if fun_rows:
+        body += _stat_section("FUN", fun_rows)
+    if body:
+        divider = (
+            f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;line-height:1px;"
+            "margin-top:8px;'>&nbsp;</div>"
+            "<div style='height:6px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+        )
+        return header + divider + body
+    return header
 
 
 def main():
@@ -1381,6 +1485,8 @@ def main():
     overlay = Overlay(cfg)
     stats = StatsClient(cfg["host"], cfg["port"])
     session = SessionStats()
+    session.recent = load_recent_results(5)  # persist last-5 across restarts
+    match_stats = MatchStats()
     hotkey_h2h = HotkeyManager(cfg["hotkeys"])
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
 
@@ -1470,6 +1576,8 @@ def main():
                 if p["key"] == self_id:
                     session.self_name = p["name"]
                     break
+        # Reset per-match aggregator using the now-known self_name.
+        match_stats.__init__(self_name=session.self_name)
         html = render_html(
             payload["players"], payload["myTeam"], payload["arena"],
             players_db, payload.get("teamColors") or {},
@@ -1501,12 +1609,13 @@ def main():
             mt = payload["myTeam"]
             score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
-        # Auto-popup the post-match summary card for ~5 seconds.
-        state["summary_html"] = render_summary_html(payload)
-        state["summary_visible"] = True
-        focus_timer.start()
-        update_overlay()
-        QTimer.singleShot(5000, hide_summary)
+        # Auto-popup the post-match summary card for ~5 seconds (config-gated).
+        if cfg.get("show_match_summary", True):
+            state["summary_html"] = render_summary_html(payload, match_stats)
+            state["summary_visible"] = True
+            focus_timer.start()
+            update_overlay()
+            QTimer.singleShot(5000, hide_summary)
 
     def on_destroyed():
         state["in_match"] = False
@@ -1530,6 +1639,7 @@ def main():
         # and match_ended/match_destroyed). Excludes free practice / training / menus.
         if state["in_match"]:
             session.on_event(event, data)
+            match_stats.on_event(event, data)
 
     stats.match_initialized.connect(on_initialized)
     stats.match_ended.connect(on_ended)
