@@ -1145,6 +1145,45 @@ def _stat_section(title: str, rows: list[str]) -> str:
     return header + "".join(rows)
 
 
+EM_DASH = f"<span style='color:{C_MUTED};'>—</span>"
+_PAIR_SEP = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
+
+
+def _opt_int(v) -> str:
+    return str(int(v)) if v else EM_DASH
+
+
+def _pair_max(scope_v: float, self_v: float) -> str:
+    """Render a max-style stat as 'scope | yours'. Scope >= self_v always.
+    If you own the scope max, drop the pair to a single number."""
+    if scope_v <= 0:
+        return EM_DASH
+    if self_v >= scope_v:
+        return str(int(scope_v))
+    right = str(int(self_v)) if self_v > 0 else EM_DASH
+    return f"{int(scope_v)}{_PAIR_SEP}{right}"
+
+
+def _pair_count(scope_v: int, self_v: int) -> str:
+    """Render a counter (saves/shots/demos/crossbars) as 'scope | yours'."""
+    if scope_v <= 0:
+        return EM_DASH
+    if self_v >= scope_v:
+        return str(int(scope_v))
+    right = str(int(self_v)) if self_v > 0 else EM_DASH
+    return f"{int(scope_v)}{_PAIR_SEP}{right}"
+
+
+def _pair_fastest(scope_v: Optional[float], self_v: Optional[float]) -> str:
+    """Render a min-style stat (fastest goal). Smaller is better."""
+    if not scope_v:
+        return EM_DASH
+    if self_v is not None and self_v <= scope_v:
+        return f"{scope_v:.1f}s"
+    right = f"{self_v:.1f}s" if self_v else EM_DASH
+    return f"{scope_v:.1f}s{_PAIR_SEP}{right}"
+
+
 def render_session_html(s: SessionStats) -> str:
     elapsed = int((datetime.now(timezone.utc) - s.started_at).total_seconds())
     h, rem = divmod(elapsed, 3600)
@@ -1177,40 +1216,6 @@ def render_session_html(s: SessionStats) -> str:
         diff_color = C_WIN if diff > 0 else C_LOSS
         goals_val += f" <span style='color:{diff_color};font-size:9pt;'>{sign}{diff}</span>"
 
-    em_dash = f"<span style='color:{C_MUTED};'>—</span>"
-
-    def _opt_int(v):
-        return str(int(v)) if v else em_dash
-
-    def _pair_int(session_v: float, self_v: float) -> str:
-        # Show one number when you own the session max; otherwise "session | yours".
-        if session_v <= 0:
-            return em_dash
-        if self_v >= session_v:
-            return str(int(session_v))
-        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
-        right = str(int(self_v)) if self_v > 0 else f"<span style='color:{C_MUTED};'>—</span>"
-        return f"{int(session_v)}{sep}{right}"
-
-    def _pair_int_self(self_v: int, session_v: int) -> str:
-        # For pure counters (saves/shots/demos), show "session | yours".
-        if session_v == 0:
-            return em_dash
-        if self_v >= session_v:
-            return str(int(session_v))
-        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
-        right = str(int(self_v)) if self_v > 0 else f"<span style='color:{C_MUTED};'>—</span>"
-        return f"{int(session_v)}{sep}{right}"
-
-    def _pair_fastest(session_v: Optional[float], self_v: Optional[float]) -> str:
-        if not session_v:
-            return em_dash
-        if self_v is not None and self_v <= session_v:
-            return f"{session_v:.1f}s"
-        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
-        right = f"{self_v:.1f}s" if self_v else f"<span style='color:{C_MUTED};'>—</span>"
-        return f"{session_v:.1f}s{sep}{right}"
-
     saves_t  = s.statfeed_counts.get("Save", 0)
     shots_t  = s.statfeed_counts.get("Shot", 0)
     demos_t  = s.statfeed_counts.get("Demolish", 0)
@@ -1225,20 +1230,20 @@ def render_session_html(s: SessionStats) -> str:
         _stat_row(
             "Best run",
             (f"<span style='color:{C_WIN};font-weight:700;'>W{s.best_win_streak}</span>"
-             if s.best_win_streak else em_dash),
+             if s.best_win_streak else EM_DASH),
         ),
-        _stat_row("Recent", _recent_pips(s.recent) if s.recent else em_dash),
+        _stat_row("Recent", _recent_pips(s.recent) if s.recent else EM_DASH),
     ]
     play_rows = [
-        _stat_row("Saves",     _pair_int_self(saves_s, saves_t)),
-        _stat_row("Shots",     _pair_int_self(shots_s, shots_t)),
-        _stat_row("Demos",     _pair_int_self(demos_s, demos_t)),
+        _stat_row("Saves",     _pair_count(saves_t, saves_s)),
+        _stat_row("Shots",     _pair_count(shots_t, shots_s)),
+        _stat_row("Demos",     _pair_count(demos_t, demos_s)),
         _stat_row("Crossbars", _opt_int(s.crossbars)),
     ]
     fun_rows = [
-        _stat_row("Max goal speed",   _pair_int(s.max_goal_speed, s.max_goal_speed_self)),
-        _stat_row("Max ball speed",   _pair_int(s.max_ball_speed, s.max_ball_speed_self)),
-        _stat_row("Hardest crossbar", _pair_int(s.max_impact_force, s.max_impact_force_self)),
+        _stat_row("Max goal speed",   _pair_max(s.max_goal_speed, s.max_goal_speed_self)),
+        _stat_row("Max ball speed",   _pair_max(s.max_ball_speed, s.max_ball_speed_self)),
+        _stat_row("Hardest crossbar", _pair_max(s.max_impact_force, s.max_impact_force_self)),
         _stat_row("Fastest goal",     _pair_fastest(s.fastest_goal_time, s.fastest_goal_time_self)),
     ]
 
@@ -1279,63 +1284,101 @@ def render_session_html(s: SessionStats) -> str:
 
 
 class MatchStats:
-    """Per-match aggregator. Reset on match_initialized, snapshot on match_ended."""
+    """Per-match aggregator. Reset on match_initialized, snapshot on match_ended.
+
+    Every metric tracks both the match-wide value (anyone) and the self-only value,
+    so the post-match summary can render 'match | yours' pairs.
+    """
 
     def __init__(self, self_name: Optional[str] = None):
         self.reset(self_name)
 
     def reset(self, self_name: Optional[str] = None) -> None:
         self.self_name = self_name
-        self.shots = 0
+        # Counters (statfeed-driven and crossbar event)
         self.saves = 0
-        self.demos_given = 0
-        self.demos_received = 0
+        self.saves_self = 0
+        self.shots = 0
+        self.shots_self = 0
+        self.demos = 0           # demolitions given, anyone
+        self.demos_self = 0      # demolitions given by you
+        self.demoed_self = 0     # times you got demolished (no match-wide pair — use total)
         self.crossbars = 0
+        self.crossbars_self = 0
+        # Maxes
         self.max_goal_speed = 0.0
+        self.max_goal_speed_self = 0.0
         self.max_ball_speed = 0.0
+        self.max_ball_speed_self = 0.0
         self.max_impact_force = 0.0
+        self.max_impact_force_self = 0.0
+        # Min (fastest goal time in seconds; None = no goal yet)
         self.fastest_goal_time: Optional[float] = None
+        self.fastest_goal_time_self: Optional[float] = None
 
     def _is_self(self, name) -> bool:
         return bool(name) and name == self.self_name
 
     def on_event(self, event: str, data: dict) -> None:
         if event == "GoalScored":
+            scorer_name = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 self.max_goal_speed = max(self.max_goal_speed, float(sp))
-            scorer = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
-            if self._is_self(scorer):
-                gt = data.get("GoalTime")
-                if isinstance(gt, (int, float)) and gt > 0:
-                    if self.fastest_goal_time is None or gt < self.fastest_goal_time:
-                        self.fastest_goal_time = float(gt)
+                if self._is_self(scorer_name):
+                    self.max_goal_speed_self = max(self.max_goal_speed_self, float(sp))
+            gt = data.get("GoalTime")
+            if isinstance(gt, (int, float)) and gt > 0:
+                if self.fastest_goal_time is None or gt < self.fastest_goal_time:
+                    self.fastest_goal_time = float(gt)
+                if self._is_self(scorer_name):
+                    if self.fastest_goal_time_self is None or gt < self.fastest_goal_time_self:
+                        self.fastest_goal_time_self = float(gt)
         elif event == "BallHit":
             ball = data.get("Ball")
-            if isinstance(ball, dict):
-                sp = ball.get("PostHitSpeed")
-                if isinstance(sp, (int, float)):
-                    self.max_ball_speed = max(self.max_ball_speed, float(sp))
+            sp = ball.get("PostHitSpeed") if isinstance(ball, dict) else None
+            if isinstance(sp, (int, float)):
+                self.max_ball_speed = max(self.max_ball_speed, float(sp))
+                hitters = data.get("Players")
+                if isinstance(hitters, list) and any(
+                    self._is_self((h or {}).get("Name")) for h in hitters if isinstance(h, dict)
+                ):
+                    self.max_ball_speed_self = max(self.max_ball_speed_self, float(sp))
         elif event == "CrossbarHit":
             self.crossbars += 1
+            last_touch = data.get("BallLastTouch")
+            toucher = None
+            if isinstance(last_touch, dict):
+                player = last_touch.get("Player")
+                if isinstance(player, dict):
+                    toucher = player.get("Name")
+            if self._is_self(toucher):
+                self.crossbars_self += 1
             ifo = data.get("ImpactForce")
             if isinstance(ifo, (int, float)):
                 self.max_impact_force = max(self.max_impact_force, float(ifo))
+                if self._is_self(toucher):
+                    self.max_impact_force_self = max(self.max_impact_force_self, float(ifo))
         elif event == "StatfeedEvent":
             ev = data.get("EventName")
             main = data.get("MainTarget") or {}
             sec = data.get("SecondaryTarget") or {}
             main_name = main.get("Name") if isinstance(main, dict) else None
             sec_name = sec.get("Name") if isinstance(sec, dict) else None
-            if self._is_self(main_name):
-                if ev == "Save":
-                    self.saves += 1
-                elif ev == "Shot":
-                    self.shots += 1
-                elif ev == "Demolish":
-                    self.demos_given += 1
-            if self._is_self(sec_name) and ev == "Demolish":
-                self.demos_received += 1
+            if ev == "Save":
+                self.saves += 1
+                if self._is_self(main_name):
+                    self.saves_self += 1
+            elif ev == "Shot":
+                self.shots += 1
+                if self._is_self(main_name):
+                    self.shots_self += 1
+            elif ev == "Demolish":
+                self.demos += 1
+                if self._is_self(main_name):
+                    self.demos_self += 1
+                if self._is_self(sec_name):
+                    self.demoed_self += 1
 
 
 def make_tray_icon() -> QIcon:
@@ -1391,22 +1434,26 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
         "</table>"
     )
 
+    # PLAY rows: hide entirely when both match-wide and self are 0.
     play_rows = []
-    if ms.saves:          play_rows.append(_stat_row("Saves",     str(ms.saves)))
-    if ms.shots:          play_rows.append(_stat_row("Shots",     str(ms.shots)))
-    if ms.demos_given:    play_rows.append(_stat_row("Demos",     str(ms.demos_given)))
-    if ms.demos_received: play_rows.append(_stat_row("Demoed",    str(ms.demos_received)))
-    if ms.crossbars:      play_rows.append(_stat_row("Crossbars", str(ms.crossbars)))
+    if ms.saves:     play_rows.append(_stat_row("Saves",     _pair_count(ms.saves, ms.saves_self)))
+    if ms.shots:     play_rows.append(_stat_row("Shots",     _pair_count(ms.shots, ms.shots_self)))
+    if ms.demos:     play_rows.append(_stat_row("Demos",     _pair_count(ms.demos, ms.demos_self)))
+    if ms.demoed_self:
+        play_rows.append(_stat_row("Demoed",    str(ms.demoed_self)))
+    if ms.crossbars: play_rows.append(_stat_row("Crossbars", _pair_count(ms.crossbars, ms.crossbars_self)))
 
     fun_rows = []
     if ms.max_goal_speed > 0:
-        fun_rows.append(_stat_row("Max goal speed",   str(int(ms.max_goal_speed))))
+        fun_rows.append(_stat_row("Max goal speed",   _pair_max(ms.max_goal_speed, ms.max_goal_speed_self)))
     if ms.max_ball_speed > 0:
-        fun_rows.append(_stat_row("Max ball speed",   str(int(ms.max_ball_speed))))
+        fun_rows.append(_stat_row("Max ball speed",   _pair_max(ms.max_ball_speed, ms.max_ball_speed_self)))
     if ms.max_impact_force > 0:
-        fun_rows.append(_stat_row("Hardest crossbar", str(int(ms.max_impact_force))))
+        fun_rows.append(_stat_row("Hardest crossbar",
+                                  _pair_max(ms.max_impact_force, ms.max_impact_force_self)))
     if ms.fastest_goal_time is not None:
-        fun_rows.append(_stat_row("Fastest goal",     f"{ms.fastest_goal_time:.1f}s"))
+        fun_rows.append(_stat_row("Fastest goal",
+                                  _pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self)))
 
     body = ""
     if play_rows:
