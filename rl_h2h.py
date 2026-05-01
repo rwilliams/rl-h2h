@@ -283,32 +283,6 @@ def append_match(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def load_recent_results(limit: int = 5) -> list:
-    """Read the last `limit` W/L results from matches.jsonl (oldest → newest)."""
-    if not MATCHES_PATH.exists():
-        return []
-    try:
-        with MATCHES_PATH.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    out: list[str] = []
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        res = rec.get("result")
-        if res in ("W", "L"):
-            out.append(res)
-            if len(out) >= limit:
-                break
-    return list(reversed(out))
-
-
 def update_players_cache(players: dict, match: dict) -> None:
     my_team = match["myTeam"]
     i_won = match["winner"] == my_team
@@ -1485,7 +1459,6 @@ def main():
     overlay = Overlay(cfg)
     stats = StatsClient(cfg["host"], cfg["port"])
     session = SessionStats()
-    session.recent = load_recent_results(5)  # persist last-5 across restarts
     match_stats = MatchStats()
     hotkey_h2h = HotkeyManager(cfg["hotkeys"])
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
