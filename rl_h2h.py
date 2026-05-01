@@ -1502,15 +1502,21 @@ def main():
             focus_timer.stop()
         update_overlay()
 
+    summary_timer = QTimer()
+    summary_timer.setSingleShot(True)
+
     def hide_summary():
+        summary_timer.stop()
         state["summary_visible"] = False
         if not _any_visible():
             focus_timer.stop()
         update_overlay()
 
+    summary_timer.timeout.connect(hide_summary)
+
     def on_initialized(payload: dict):
         state["in_match"] = True
-        state["summary_visible"] = False  # clear stale post-match summary
+        hide_summary()  # next match starting → drop any in-flight post-match popup
         # Auto-detect self in 1v1: only one teammate on my side = me. Persist to config.
         if not cfg.get("self_player_id"):
             mt = payload["myTeam"]
@@ -1560,16 +1566,19 @@ def main():
             mt = payload["myTeam"]
             score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
-        # Auto-popup the post-match summary card for ~5 seconds (config-gated).
+        # Auto-popup the post-match summary card. Stays up until the next match
+        # starts (match_initialized) or the user leaves to the menu (match_destroyed),
+        # with a 30s safety net for cases where neither event fires.
         if cfg.get("show_match_summary", True):
             state["summary_html"] = render_summary_html(payload, match_stats)
             state["summary_visible"] = True
             focus_timer.start()
             update_overlay()
-            QTimer.singleShot(5000, hide_summary)
+            summary_timer.start(30000)
 
     def on_destroyed():
         state["in_match"] = False
+        hide_summary()  # leaving the match → drop the post-match popup
         state["h2h_html"] = idle_html("Waiting for next match…")
         update_overlay()
 
