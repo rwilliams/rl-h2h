@@ -183,26 +183,79 @@ class StatsClient(QObject):
             self.connection_status.emit(False)
 
     async def _connect_loop(self):
-        url = f"ws://{self.host}:{self.port}"
+        # The official doc calls it a "web socket", but in practice RL appears to expose
+        # raw TCP NDJSON. Try WS first; on handshake failure, switch to raw TCP for the
+        # rest of the process lifetime.
         backoff = 1.0
+        use_ws = True
         while True:
             try:
-                async with websockets.connect(
-                    url, ping_interval=20, ping_timeout=20, max_size=2 ** 22,
-                ) as ws:
-                    self.connection_status.emit(True)
-                    backoff = 1.0
-                    async for raw in ws:
-                        try:
-                            self._handle(json.loads(raw))
-                        except json.JSONDecodeError:
-                            continue
+                if use_ws:
+                    try:
+                        print(f"[stats] connecting ws://{self.host}:{self.port}", file=sys.stderr)
+                        await self._run_ws()
+                    except (websockets.exceptions.InvalidHandshake,
+                            websockets.exceptions.InvalidMessage) as e:
+                        print(f"[stats] WS handshake rejected ({type(e).__name__}); "
+                              "switching to raw TCP", file=sys.stderr)
+                        use_ws = False
+                        continue
+                else:
+                    print(f"[stats] connecting tcp://{self.host}:{self.port}", file=sys.stderr)
+                    await self._run_tcp()
+                print("[stats] disconnected; reconnecting", file=sys.stderr)
+                backoff = 1.0
             except asyncio.CancelledError:
                 raise
-            except (OSError, websockets.WebSocketException):
+            except (OSError, websockets.WebSocketException) as e:
                 self.connection_status.emit(False)
+                print(f"[stats] {type(e).__name__}: {e}", file=sys.stderr)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    async def _run_ws(self):
+        async with websockets.connect(
+            f"ws://{self.host}:{self.port}",
+            ping_interval=20, ping_timeout=20, max_size=2 ** 22,
+        ) as ws:
+            self.connection_status.emit(True)
+            print("[stats] connected (websocket)", file=sys.stderr)
+            async for raw in ws:
+                try:
+                    self._handle(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+
+    async def _run_tcp(self):
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+        try:
+            self.connection_status.emit(True)
+            print("[stats] connected (raw tcp)", file=sys.stderr)
+            decoder = json.JSONDecoder()
+            buf = ""
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    return
+                buf += chunk.decode("utf-8", errors="replace")
+                while True:
+                    stripped = buf.lstrip()
+                    if not stripped:
+                        buf = ""
+                        break
+                    try:
+                        obj, idx = decoder.raw_decode(stripped)
+                    except json.JSONDecodeError:
+                        buf = stripped
+                        break
+                    buf = stripped[idx:]
+                    self._handle(obj)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     def _handle(self, msg: dict):
         event = msg.get("Event")
@@ -576,12 +629,16 @@ def main():
     stats = StatsClient(cfg["host"], cfg["port"])
     hotkey = HotkeyBridge(cfg["hotkey"])
 
+    state = {"in_match": False}
+
     def on_initialized(payload: dict):
+        state["in_match"] = True
         html = render_html(payload["players"], payload["myTeam"], payload["arena"], players_db)
         overlay.set_html(html)
         print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
 
     def on_ended(payload: dict):
+        state["in_match"] = False
         i_won = payload["winner"] == payload["myTeam"]
         record = {
             "matchGuid": payload.get("matchGuid"),
@@ -598,10 +655,15 @@ def main():
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}")
 
     def on_destroyed():
+        state["in_match"] = False
         overlay.set_html(idle_html("Waiting for next match…"))
 
     def on_status(connected: bool):
-        if not connected:
+        if state["in_match"]:
+            return
+        if connected:
+            overlay.set_html(idle_html("Connected — waiting for match…"))
+        else:
             overlay.set_html(idle_html("Disconnected — is RL running with the Stats API enabled?"))
 
     def on_press():
