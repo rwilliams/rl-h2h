@@ -1595,10 +1595,10 @@ def main():
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
                 spacer = (
-                    "<div style='height:14px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+                    "<div style='height:24px;font-size:1px;line-height:1px;'>&nbsp;</div>"
                     f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;"
                     "line-height:1px;'>&nbsp;</div>"
-                    "<div style='height:14px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+                    "<div style='height:24px;font-size:1px;line-height:1px;'>&nbsp;</div>"
                 )
                 overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
             else:
