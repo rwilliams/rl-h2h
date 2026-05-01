@@ -13,12 +13,20 @@ __pycache__/
 .venv/
 venv/
 env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Editor / OS
 .vscode/
 .idea/
+.obsidian/
 .DS_Store
 Thumbs.db
+*.log
 
 # Scratch / tooling
 .playwright-mcp/

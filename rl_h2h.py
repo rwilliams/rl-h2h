@@ -8,17 +8,18 @@ while the configured hotkey is held.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import json
 import os
 import sys
 import threading
+from collections import deque
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import websockets
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
@@ -179,28 +180,42 @@ DEFAULT_CONFIG = {
 }
 
 
+# Cached Win32 bindings for is_rl_focused — hoisted to avoid re-loading WinDLL each poll.
+if sys.platform == "win32":
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD)
+    ]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+else:
+    _user32 = _kernel32 = None  # type: ignore[assignment]
+
+
 def is_rl_focused() -> bool:
     """True when Rocket League is the foreground window. Always True on non-Windows."""
-    if sys.platform != "win32":
+    if _user32 is None or _kernel32 is None:
         return True
     try:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        hwnd = user32.GetForegroundWindow()
+        hwnd = _user32.GetForegroundWindow()
         if not hwnd:
             return False
         pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        h_proc = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h_proc = _kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not h_proc:
             return False
         try:
-            buf = (ctypes.c_wchar * 260)()
+            buf = ctypes.create_unicode_buffer(260)
             size = wintypes.DWORD(260)
-            if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+            if _kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
                 return buf.value.lower().endswith("rocketleague.exe")
         finally:
-            kernel32.CloseHandle(h_proc)
+            _kernel32.CloseHandle(h_proc)
     except Exception:
         return False
     return False
@@ -316,11 +331,7 @@ def update_players_cache(players: dict, match: dict) -> None:
 
 
 class StatsClient(QObject):
-    """Reads the Rocket League Stats API local TCP socket and emits match-lifecycle signals.
-
-    Verbose-debug mode: lots of [stats]/[tcp]/[evt]/[state]/[emit] logging on stderr to
-    help diagnose remaining issues. To be cleaned up once stable.
-    """
+    """Reads the Rocket League Stats API local TCP socket and emits match-lifecycle signals."""
 
     match_initialized = Signal(dict)
     match_ended = Signal(dict)
@@ -335,10 +346,6 @@ class StatsClient(QObject):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="StatsClient")
-        # Cross-match diagnostics — survive _reset().
-        self._event_counts: dict[str, int] = {}
-        self._first_seen: set[str] = set()
-        self._sample_remaining = 2
         self._reset()
 
     def _reset(self):
@@ -352,7 +359,7 @@ class StatsClient(QObject):
         self._spectator_warned = False
         self._score: list[int] = [0, 0]
         self._team_colors: dict[int, str] = {}
-        self._in_replay: bool = False
+        self._in_replay = False
 
     def start(self):
         self._thread.start()
@@ -380,9 +387,7 @@ class StatsClient(QObject):
             self.connection_status.emit(False)
 
     async def _connect_loop(self):
-        # The official doc calls it a "web socket" but the wire format is raw TCP NDJSON.
-        # We confirmed this end-to-end; skip the WS probe (it costs a 10s open_timeout
-        # when RL hasn't pushed bytes yet, with no path to fall back).
+        # Local Stats API speaks raw TCP NDJSON despite the doc calling it a "web socket".
         backoff = 1.0
         while True:
             try:
@@ -402,21 +407,13 @@ class StatsClient(QObject):
     async def _run_tcp(self):
         reader, writer = await asyncio.open_connection(self.host, self.port)
         self.connection_status.emit(True)
-        print(f"[tcp] connected to {self.host}:{self.port}", file=sys.stderr)
-        bytes_total = 0
-        msgs_total = 0
-        loop = asyncio.get_running_loop()
-        last_alive = loop.time()
         try:
             decoder = json.JSONDecoder()
             buf = ""
             while True:
                 chunk = await reader.read(65536)
                 if not chunk:
-                    print(f"[tcp] EOF after {bytes_total} bytes / {msgs_total} msgs",
-                          file=sys.stderr)
                     return
-                bytes_total += len(chunk)
                 buf += chunk.decode("utf-8", errors="replace")
                 while True:
                     stripped = buf.lstrip()
@@ -429,42 +426,16 @@ class StatsClient(QObject):
                         buf = stripped
                         break
                     buf = stripped[idx:]
-                    msgs_total += 1
                     self._safe_handle(obj)
-                now = loop.time()
-                if now - last_alive >= 60.0:
-                    last_alive = now
-                    print(f"[tcp] alive: bytes={bytes_total} msgs={msgs_total} "
-                          f"events={{{self._event_summary()}}}", file=sys.stderr)
         finally:
             writer.close()
-            try:
+            with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            except Exception:
-                pass
-            print(f"[tcp] closed after {bytes_total} bytes / {msgs_total} msgs",
-                  file=sys.stderr)
-
-    def _event_summary(self) -> str:
-        if not self._event_counts:
-            return ""
-        return ", ".join(f"{k}={v}" for k, v in sorted(self._event_counts.items()))
 
     def _safe_handle(self, msg) -> None:
         if not isinstance(msg, dict):
-            if self._sample_remaining > 0:
-                self._sample_remaining -= 1
-                print(f"[stats] non-dict msg: {repr(msg)[:200]}", file=sys.stderr)
             return
         event = msg.get("Event", "?")
-        self._event_counts[event] = self._event_counts.get(event, 0) + 1
-        if event not in self._first_seen:
-            self._first_seen.add(event)
-            try:
-                snippet = json.dumps(msg)[:600]
-            except Exception:
-                snippet = repr(msg)[:600]
-            print(f"[stats] first {event}: {snippet}", file=sys.stderr)
         try:
             self._handle(msg)
         except Exception as e:
@@ -489,29 +460,23 @@ class StatsClient(QObject):
         if event == EVT_UPDATE_STATE:
             self._on_update_state(data)
         elif event == EVT_MATCH_CREATED:
-            guid = data.get("MatchGuid") or "(empty)"
-            print(f"[evt] MatchCreated guid={guid!r}", file=sys.stderr)
             self._reset()
             self._match_guid = data.get("MatchGuid")
         elif event == EVT_MATCH_INITIALIZED:
-            print(f"[evt] {event}", file=sys.stderr)
             self._maybe_emit_initialized()
         elif event == EVT_ROUND_STARTED:
             # Lock the roster at kickoff. One last emit if anyone joined since the
             # previous emit; from this point we stop accumulating players.
             self._maybe_emit_initialized()
             if self._initialized_emitted and len(self._roster) > self._last_emitted_roster_size:
-                self._emit_match_initialized(reason="round started, final roster")
+                self._emit_match_initialized()
             self._round_started = True
         elif event == EVT_MATCH_ENDED:
-            print(f"[evt] MatchEnded data={data}", file=sys.stderr)
             self._on_match_ended(data)
         elif event == EVT_MATCH_DESTROYED:
-            print("[evt] MatchDestroyed", file=sys.stderr)
             self.match_destroyed.emit()
             self._reset()
         elif event == EVT_REPLAY_CREATED:
-            print("[evt] ReplayCreated — entering replay mode, recording paused", file=sys.stderr)
             self._in_replay = True
 
     def _on_update_state(self, data: dict):
@@ -521,7 +486,6 @@ class StatsClient(QObject):
         if isinstance(game, dict):
             arena = game.get("Arena")
             if isinstance(arena, str) and arena and arena != self._arena:
-                print(f"[state] arena={arena!r}", file=sys.stderr)
                 self._arena = arena
             teams = game.get("Teams")
             if isinstance(teams, list):
@@ -534,10 +498,12 @@ class StatsClient(QObject):
                     sc = t.get("Score")
                     if isinstance(sc, int):
                         self._score[int(tn)] = sc
-                    cp = t.get("ColorPrimary")
-                    if (int(tn) not in self._team_colors and isinstance(cp, str)
-                            and len(cp) == 6):
-                        self._team_colors[int(tn)] = "#" + cp.upper()
+                    # Skip color capture once both teams' colors are known.
+                    if len(self._team_colors) < 2:
+                        cp = t.get("ColorPrimary")
+                        if (int(tn) not in self._team_colors and isinstance(cp, str)
+                                and len(cp) == 6):
+                            self._team_colors[int(tn)] = "#" + cp.upper()
         # Once the round has actually started (kickoff fired), the roster is locked.
         # Until then we keep accumulating — players load asynchronously in 2v2/3v3.
         if self._round_started:
@@ -554,7 +520,6 @@ class StatsClient(QObject):
             if not isinstance(pid, str) or team not in (0, 1):
                 continue
             key = player_key(pid)
-            is_new = key not in self._roster
             name_raw = p.get("Name")
             name = name_raw if isinstance(name_raw, str) else "?"
             self._roster[key] = {
@@ -563,15 +528,12 @@ class StatsClient(QObject):
                 "name": name,
                 "team": int(team),
             }
-            if is_new:
-                print(f"[state] +player {name!r} team={team} ({pid})", file=sys.stderr)
             if any(k in p for k in SPECTATOR_FIELDS):
                 spectator_team_hits.add(int(team))
         # Spectator-only fields appear iff the local client is on this player's team.
         # If both teams report them, the user is spectating — leave my_team unset.
         if self._my_team is None and len(spectator_team_hits) == 1:
             (self._my_team,) = spectator_team_hits
-            print(f"[state] my_team={self._my_team}", file=sys.stderr)
         elif self._my_team is None and len(spectator_team_hits) > 1 and not self._spectator_warned:
             self._spectator_warned = True
             print(f"[state] spectator mode? both teams report spectator fields: "
@@ -581,19 +543,14 @@ class StatsClient(QObject):
         if not self._initialized_emitted:
             self._maybe_emit_initialized()
         elif len(self._roster) > self._last_emitted_roster_size:
-            self._emit_match_initialized(reason="roster grew")
+            self._emit_match_initialized()
 
     def _on_match_ended(self, data: dict):
         if self._in_replay:
-            print("[emit] MatchEnded skipped: in replay", file=sys.stderr)
             return
         winner = data.get("WinnerTeamNum")
         if winner is None or self._my_team is None or not self._roster:
-            print(f"[emit] MatchEnded skipped: winner={winner} my_team={self._my_team} "
-                  f"roster={len(self._roster)}", file=sys.stderr)
             return
-        print(f"[emit] match_ended winner={winner} my_team={self._my_team} "
-              f"roster={len(self._roster)} score={self._score}", file=sys.stderr)
         self.match_ended.emit({
             "winner": int(winner),
             "myTeam": self._my_team,
@@ -612,15 +569,10 @@ class StatsClient(QObject):
         if len(teams) < 2:
             return
         self._initialized_emitted = True
-        self._emit_match_initialized(reason="first emit")
+        self._emit_match_initialized()
 
-    def _emit_match_initialized(self, reason: str = ""):
-        teams = sorted({p["team"] for p in self._roster.values()})
+    def _emit_match_initialized(self):
         self._last_emitted_roster_size = len(self._roster)
-        tag = f" ({reason})" if reason else ""
-        print(f"[emit] match_initialized my_team={self._my_team} "
-              f"roster={len(self._roster)} teams={teams} arena={self._arena!r}{tag}",
-              file=sys.stderr)
         self.match_initialized.emit({
             "teamColors": dict(self._team_colors),
             "arena": self._arena,
@@ -1071,7 +1023,7 @@ class SessionStats:
         self.win_streak = 0
         self.loss_streak = 0
         self.best_win_streak = 0
-        self.recent: list[str] = []  # last 5 results (W/L), persisted via matches.jsonl
+        self.recent: deque = deque(maxlen=5)  # session-only last 5 results (W/L)
         self.goals_for = 0
         self.goals_against = 0
         self.crossbars = 0
@@ -1157,7 +1109,6 @@ class SessionStats:
             self.loss_streak += 1
             self.win_streak = 0
         self.recent.append("W" if i_won else "L")
-        self.recent = self.recent[-5:]
         score = payload.get("score")
         if isinstance(score, list) and len(score) == 2:
             mt = payload["myTeam"]
@@ -1327,6 +1278,9 @@ class MatchStats:
     """Per-match aggregator. Reset on match_initialized, snapshot on match_ended."""
 
     def __init__(self, self_name: Optional[str] = None):
+        self.reset(self_name)
+
+    def reset(self, self_name: Optional[str] = None) -> None:
         self.self_name = self_name
         self.shots = 0
         self.saves = 0
@@ -1467,11 +1421,9 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
-        try:
+        with contextlib.suppress(Exception):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
 
     cfg = load_config()
     players_db = load_players()
@@ -1493,7 +1445,6 @@ def main():
         "summary_visible": False,
         "summary_html": "",
         "h2h_html": idle_html("Waiting for Rocket League…"),
-        "idle_html": idle_html("Waiting for Rocket League…"),
     }
 
     def _any_visible() -> bool:
@@ -1573,7 +1524,7 @@ def main():
                     session.self_name = p["name"]
                     break
         # Reset per-match aggregator using the now-known self_name.
-        match_stats.__init__(self_name=session.self_name)
+        match_stats.reset(self_name=session.self_name)
         html = render_html(
             payload["players"], payload["myTeam"], payload["arena"],
             players_db, payload.get("teamColors") or {},
@@ -1616,7 +1567,6 @@ def main():
     def on_destroyed():
         state["in_match"] = False
         state["h2h_html"] = idle_html("Waiting for next match…")
-        state["idle_html"] = state["h2h_html"]
         update_overlay()
 
     def on_status(connected: bool):
@@ -1627,7 +1577,6 @@ def main():
         else:
             state["h2h_html"] = idle_html(
                 "Disconnected — is RL running with the Stats API enabled?")
-        state["idle_html"] = state["h2h_html"]
         update_overlay()
 
     def on_event_for_session(event: str, data: dict):
@@ -1669,12 +1618,10 @@ def main():
             try:
                 if sys.platform == "win32":
                     os.startfile(str(APP_DIR))  # type: ignore[attr-defined]
-                elif sys.platform == "darwin":
-                    import subprocess
-                    subprocess.Popen(["open", str(APP_DIR)])
                 else:
                     import subprocess
-                    subprocess.Popen(["xdg-open", str(APP_DIR)])
+                    opener = "open" if sys.platform == "darwin" else "xdg-open"
+                    subprocess.Popen([opener, str(APP_DIR)])
             except Exception as e:
                 print(f"[tray] open folder failed: {e}", file=sys.stderr)
         open_action.triggered.connect(_open_folder)
