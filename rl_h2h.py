@@ -517,12 +517,6 @@ class StatsClient(QObject):
                 data = {}
         if not isinstance(data, dict):
             data = {}
-        # GoalScored: detect own-goals by comparing Scorer.TeamNum to the team
-        # of the last player to touch the ball (BallLastTouch). RL credits goals
-        # to the last *opposing* player who touched it, so an own-goal shows up
-        # as "scorer is on the team opposite to whoever actually put the ball in
-        # the net". RL also emits placeholder GoalScored events with empty
-        # scorer info — those are dropped.
         if event == EVT_GOAL_SCORED:
             if self._classify_goal_scored(data):
                 self.event_seen.emit(event, data)
@@ -633,33 +627,24 @@ class StatsClient(QObject):
         })
 
     def _classify_goal_scored(self, data: dict) -> bool:
-        """Set `bOwnGoal` on data; return False for placeholder events to drop.
+        """Set `bOwnGoal` on data; return False for placeholder events.
 
-        RL emits a placeholder `GoalScored` (empty Scorer) alongside the real
-        one for each goal — drop those. Own-goal flag is set when Scorer and
-        BallLastTouch are on different teams: RL credits goals to a player on
-        the scoring side, so a cross-team last-touch means the ball was put
-        in by someone on the team that got scored on.
+        See `rl_api_text.md` for the placeholder-event quirk and own-goal
+        derivation rules.
         """
         scorer = data.get("Scorer")
         if not isinstance(scorer, dict):
-            scorer = None
-        scorer_name = scorer.get("Name") if scorer else None
+            return False
+        scorer_name = scorer.get("Name")
         if not scorer_name:
-            print("[goal] dropped placeholder event (empty scorer)", file=sys.stderr)
             return False
         scorer_team = scorer.get("TeamNum")
-        last_name, last_team = _last_touch_player(data)
-        is_own_goal = (
+        _, last_team = _last_touch_player(data)
+        data["bOwnGoal"] = (
             scorer_team in (0, 1)
             and last_team in (0, 1)
             and scorer_team != last_team
         )
-        data["bOwnGoal"] = is_own_goal
-        print(f"[goal] {'OWN-GOAL' if is_own_goal else 'NORMAL'}: "
-              f"scorer={scorer_name!r} (team {scorer_team}) "
-              f"last_touch={last_name!r} (team {last_team})",
-              file=sys.stderr)
         return True
 
     def _maybe_emit_initialized(self):
@@ -1152,8 +1137,8 @@ class SessionStats:
         self.max_impact_force_self = 0.0
         self.fastest_goal_time: Optional[float] = None
         self.fastest_goal_time_self: Optional[float] = None
-        self.own_goals = 0       # any cross-team last-touch this session
-        self.own_goals_self = 0  # when *you* were the last touch
+        self.own_goals = 0
+        self.own_goals_self = 0
         self.statfeed_counts: dict[str, int] = {}
         self.statfeed_counts_self: dict[str, int] = {}
 
