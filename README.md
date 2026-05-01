@@ -84,13 +84,12 @@ To launch automatically every time Windows boots, press **Win + R**, type `shell
 
 The overlay is **held**, not toggled. Defaults match Rocket League's stock scoreboard binding so you can naturally peek at both at the same time.
 
-| Action                          | PC      | Xbox    | PlayStation |
-|---------------------------------|---------|---------|-------------|
-| Head-to-head                    | **Tab** | **LB**  | **L1**      |
-| Session stats / MMR graph       | **F12** | —       | —           |
-| Toggle expanded H2H *or* graph  | **F11** | —       | —           |
-| Cycle MMR category              | **F10** | —       | —           |
-| Cycle graph playlist            | **F9**  | —       | —           |
+| Action                                             | PC      | Xbox    | PlayStation |
+|----------------------------------------------------|---------|---------|-------------|
+| Head-to-head                                       | **Tab** | **LB**  | **L1**      |
+| Session stats / MMR graph                          | **F12** | —       | —           |
+| Toggle expanded H2H *or* swap session ↔ graph      | **F11** | —       | —           |
+| Cycle MMR category *or* graph playlist             | **F10** | —       | —           |
 
 Hold to show; release to hide. Multiple bindings can be combined; the overlay shows while *any* of them is held.
 
@@ -98,9 +97,11 @@ Hold to show; release to hide. Multiple bindings can be combined; the overlay sh
 - While **Tab** is held (or nothing is held): toggles whether the H2H card also shows the session stats below. The choice persists across launches.
 - While **F12** is held: swaps the session card to a **MMR graph** view of your last 30 ranked matches for the selected playlist, with W/L markers, faint rank-zone bands behind the line, and your net MMR delta over the visible window. Same key, second press → back to the session card.
 
-**F10** cycles the MMR category shown next to each opponent in the H2H card — `best → 1v1 → 2v2 → 3v3 → best`. The active category is shown in the H2H header (`MMR · BEST`) and the footer hint. The choice persists. F10 only does anything if MMR display is enabled — see below.
+**F10** is also context-sensitive:
+- In the **H2H card**: cycles the MMR category shown next to each opponent — `best → 1v1 → 2v2 → 3v3 → best`. Active category appears in the H2H header (`MMR · BEST`) and the footer hint. Only does anything if MMR display is enabled — see below.
+- In the **graph view** (F12 held + graph open): cycles the plotted playlist — `1v1 → 2v2 → 3v3`. Active playlist shows in the graph header (`MMR · 2V2`).
 
-**F9** cycles the playlist plotted in the graph view — `1v1 → 2v2 → 3v3`. Only active while F12 is held *and* you're on the graph (not the session card). The choice persists.
+Both choices persist independently across launches.
 
 ## MMR display
 

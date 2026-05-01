@@ -181,8 +181,12 @@ DEFAULT_CONFIG = {
         "name_max_length:       player name truncation length in the H2H card (default 16).",
         "expand_hotkeys:        press to toggle the H2H overlay between compact and expanded.",
         "                       Expanded mode appends the session stats below the H2H card.",
-        "cycle_hotkeys:         press to cycle the MMR category shown in the H2H overlay.",
-        "                       Order: best -> 1v1 -> 2v2 -> 3v3 -> best. Persists.",
+        "cycle_hotkeys:         press to cycle. Context-sensitive:",
+        "                         - in H2H view: cycle MMR category",
+        "                           (best -> 1v1 -> 2v2 -> 3v3 -> best)",
+        "                         - in graph view (F12 held + graph open):",
+        "                           cycle plotted playlist (1v1 -> 2v2 -> 3v3)",
+        "                       Both choices persist independently.",
         "h2h_default_expanded:  initial expanded state at script launch. Re-saved on every",
         "                       toggle so your last choice persists across restarts.",
         "mmr_enabled:           when true, fetches each opponent's rank/MMR from",
@@ -192,9 +196,6 @@ DEFAULT_CONFIG = {
         "                       (other platforms) to tracker.network. Toggle via the tray menu.",
         "mmr_category:          which playlist's MMR to show: 'best' | '1v1' | '2v2' | '3v3'.",
         "                       Cycle live with the cycle_hotkeys key.",
-        "graph_playlist_hotkeys: press to cycle the playlist shown in the graph view",
-        "                       (1v1 -> 2v2 -> 3v3 -> 1v1). Only active while F12 is held",
-        "                       and the session card is in graph mode.",
         "session_view:          which sub-view F12 shows: 'session' (stats card) | 'graph'",
         "                       (your MMR over time). Toggle with the expand_hotkeys key",
         "                       while F12 is held.",
@@ -223,7 +224,6 @@ DEFAULT_CONFIG = {
     "session_hotkeys": ["f12"],
     "expand_hotkeys": ["f11"],
     "cycle_hotkeys": ["f10"],
-    "graph_playlist_hotkeys": ["f9"],
     "h2h_default_expanded": False,
     "mmr_enabled": False,
     "mmr_category": "best",
@@ -2532,7 +2532,7 @@ def render_graph_pixmap(playlist: str, snapshots: list[dict],
     painter.drawText(plot_left, HEADER_H - 8,
                      f"MMR · {playlist.upper()}")
 
-    cycle_label = _first_keyboard_label(cfg.get("graph_playlist_hotkeys") or [])
+    cycle_label = _first_keyboard_label(cfg.get("cycle_hotkeys") or [])
     expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
 
     if len(points) < 2:
@@ -2653,7 +2653,7 @@ def _draw_graph_footer(painter: QPainter, cfg: dict, playlist: str,
                        body_font: QFont, small_font: QFont) -> None:
     """Hotkey hints + active playlist label, painted directly onto the
     pixmap because we're not in HTML mode here."""
-    cycle_label = _first_keyboard_label(cfg.get("graph_playlist_hotkeys") or [])
+    cycle_label = _first_keyboard_label(cfg.get("cycle_hotkeys") or [])
     expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
     parts = []
     if expand_label:
@@ -2697,7 +2697,6 @@ def main():
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
     hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
     hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
-    hotkey_graph_pl = HotkeyManager(cfg.get("graph_playlist_hotkeys") or [])
 
     # Sanitize the persisted category once at startup — guards against a hand-edited
     # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
@@ -3058,25 +3057,24 @@ def main():
 
     hotkey_expand.pressed.connect(toggle_expand)
 
+
     GRAPH_PLAYLISTS = ("1v1", "2v2", "3v3")
 
-    def cycle_graph_playlist():
-        # No-op unless the user is actually looking at the graph — F9 should
-        # not change persistent state when held outside of session+graph view.
-        if not (state["session_held"] and state["session_view"] == "graph"):
-            return
-        cur = state["graph_playlist"]
-        i = GRAPH_PLAYLISTS.index(cur) if cur in GRAPH_PLAYLISTS else -1
-        nxt = GRAPH_PLAYLISTS[(i + 1) % len(GRAPH_PLAYLISTS)]
-        state["graph_playlist"] = nxt
-        cfg["graph_playlist"] = nxt
-        save_config(cfg)
-        print(f"[overlay] graph_playlist={nxt}", file=sys.stderr)
-        update_overlay()
-
-    hotkey_graph_pl.pressed.connect(cycle_graph_playlist)
-
     def cycle_mmr_category():
+        # Context-sensitive: while the graph view is showing (F12 held +
+        # session_view=="graph"), F10 cycles the graph's playlist instead of
+        # the H2H MMR category. Same key, different role per context — same
+        # idea as F11 (expand H2H vs swap session subview).
+        if state["session_held"] and state["session_view"] == "graph":
+            cur_pl = state["graph_playlist"]
+            i = GRAPH_PLAYLISTS.index(cur_pl) if cur_pl in GRAPH_PLAYLISTS else -1
+            nxt_pl = GRAPH_PLAYLISTS[(i + 1) % len(GRAPH_PLAYLISTS)]
+            state["graph_playlist"] = nxt_pl
+            cfg["graph_playlist"] = nxt_pl
+            save_config(cfg)
+            mmr_log(f"F10 cycle_graph_playlist: {cur_pl!r} -> {nxt_pl!r}")
+            update_overlay()
+            return
         cur = cfg.get("mmr_category", "best")
         try:
             i = MMR_CATEGORIES.index(cur)
@@ -3341,7 +3339,6 @@ def main():
     hotkey_session.start()
     hotkey_expand.start()
     hotkey_cycle.start()
-    hotkey_graph_pl.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
           f"expand={cfg.get('expand_hotkeys') or []} "
@@ -3360,7 +3357,6 @@ def main():
     hotkey_session.stop()
     hotkey_expand.stop()
     hotkey_cycle.stop()
-    hotkey_graph_pl.stop()
     mmr_client.stop()
     sys.exit(rc)
 
