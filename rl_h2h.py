@@ -1025,6 +1025,7 @@ class SessionStats:
 
     def __init__(self):
         self.started_at = datetime.now(timezone.utc)
+        self.self_name: Optional[str] = None
         self.matches = 0
         self.wins = 0
         self.losses = 0
@@ -1034,36 +1035,74 @@ class SessionStats:
         self.goals_for = 0
         self.goals_against = 0
         self.crossbars = 0
+        # Each "max" is a pair: session-wide (anyone) and self-only.
         self.max_goal_speed = 0.0
+        self.max_goal_speed_self = 0.0
         self.max_ball_speed = 0.0
+        self.max_ball_speed_self = 0.0
         self.max_impact_force = 0.0
+        self.max_impact_force_self = 0.0
         self.fastest_goal_time: Optional[float] = None
+        self.fastest_goal_time_self: Optional[float] = None
         self.statfeed_counts: dict[str, int] = {}
+        self.statfeed_counts_self: dict[str, int] = {}
+
+    def _is_self(self, name: Optional[str]) -> bool:
+        return bool(name) and name == self.self_name
 
     def on_event(self, event: str, data: dict) -> None:
         if event == "GoalScored":
+            scorer_name = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
-                self.max_goal_speed = max(self.max_goal_speed, float(sp))
+                if sp > self.max_goal_speed:
+                    self.max_goal_speed = float(sp)
+                if self._is_self(scorer_name) and sp > self.max_goal_speed_self:
+                    self.max_goal_speed_self = float(sp)
             gt = data.get("GoalTime")
-            if isinstance(gt, (int, float)):
+            # Filter out 0 — it's an API artifact (e.g. first goal of a session, or
+            # instant goals) that would otherwise pin "fastest goal" to 0 forever.
+            if isinstance(gt, (int, float)) and gt > 0:
                 if self.fastest_goal_time is None or gt < self.fastest_goal_time:
                     self.fastest_goal_time = float(gt)
+                if self._is_self(scorer_name):
+                    if self.fastest_goal_time_self is None or gt < self.fastest_goal_time_self:
+                        self.fastest_goal_time_self = float(gt)
         elif event == "CrossbarHit":
             self.crossbars += 1
+            last_touch = data.get("BallLastTouch") or {}
+            toucher_name = None
+            if isinstance(last_touch, dict):
+                p = last_touch.get("Player")
+                if isinstance(p, dict):
+                    toucher_name = p.get("Name")
             ifo = data.get("ImpactForce")
             if isinstance(ifo, (int, float)):
-                self.max_impact_force = max(self.max_impact_force, float(ifo))
+                if ifo > self.max_impact_force:
+                    self.max_impact_force = float(ifo)
+                if self._is_self(toucher_name) and ifo > self.max_impact_force_self:
+                    self.max_impact_force_self = float(ifo)
         elif event == "BallHit":
             ball = data.get("Ball")
+            sp = None
             if isinstance(ball, dict):
                 sp = ball.get("PostHitSpeed")
-                if isinstance(sp, (int, float)):
-                    self.max_ball_speed = max(self.max_ball_speed, float(sp))
+            if isinstance(sp, (int, float)):
+                if sp > self.max_ball_speed:
+                    self.max_ball_speed = float(sp)
+                # BallHit can have multiple players in the same frame — count if any is self.
+                hitters = data.get("Players")
+                if isinstance(hitters, list):
+                    if any(self._is_self((h or {}).get("Name")) for h in hitters if isinstance(h, dict)):
+                        if sp > self.max_ball_speed_self:
+                            self.max_ball_speed_self = float(sp)
         elif event == "StatfeedEvent":
             ev_name = data.get("EventName")
             if isinstance(ev_name, str) and ev_name:
                 self.statfeed_counts[ev_name] = self.statfeed_counts.get(ev_name, 0) + 1
+                main = data.get("MainTarget") or {}
+                if isinstance(main, dict) and self._is_self(main.get("Name")):
+                    self.statfeed_counts_self[ev_name] = self.statfeed_counts_self.get(ev_name, 0) + 1
 
     def on_match_ended(self, payload: dict) -> None:
         self.matches += 1
@@ -1141,29 +1180,64 @@ def render_session_html(s: SessionStats) -> str:
         diff_color = C_WIN if diff > 0 else C_LOSS
         goals_val += f" <span style='color:{diff_color};font-size:9pt;'>{sign}{diff}</span>"
 
-    def _opt_int(v):
-        return str(int(v)) if v else f"<span style='color:{C_MUTED};'>—</span>"
+    em_dash = f"<span style='color:{C_MUTED};'>—</span>"
 
-    def _opt_float_s(v):
-        return f"{v:.1f}s" if v is not None else f"<span style='color:{C_MUTED};'>—</span>"
+    def _opt_int(v):
+        return str(int(v)) if v else em_dash
+
+    def _pair_int(session_v: float, self_v: float) -> str:
+        # Show one number when you own the session max; otherwise "session | yours".
+        if session_v <= 0:
+            return em_dash
+        if self_v >= session_v:
+            return str(int(session_v))
+        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
+        right = str(int(self_v)) if self_v > 0 else f"<span style='color:{C_MUTED};'>—</span>"
+        return f"{int(session_v)}{sep}{right}"
+
+    def _pair_int_self(self_v: int, session_v: int) -> str:
+        # For pure counters (saves/shots/demos), show "session | yours".
+        if session_v == 0:
+            return em_dash
+        if self_v >= session_v:
+            return str(int(session_v))
+        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
+        right = str(int(self_v)) if self_v > 0 else f"<span style='color:{C_MUTED};'>—</span>"
+        return f"{int(session_v)}{sep}{right}"
+
+    def _pair_fastest(session_v: Optional[float], self_v: Optional[float]) -> str:
+        if not session_v:
+            return em_dash
+        if self_v is not None and self_v <= session_v:
+            return f"{session_v:.1f}s"
+        sep = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
+        right = f"{self_v:.1f}s" if self_v else f"<span style='color:{C_MUTED};'>—</span>"
+        return f"{session_v:.1f}s{sep}{right}"
+
+    saves_t  = s.statfeed_counts.get("Save", 0)
+    shots_t  = s.statfeed_counts.get("Shot", 0)
+    demos_t  = s.statfeed_counts.get("Demolish", 0)
+    saves_s  = s.statfeed_counts_self.get("Save", 0)
+    shots_s  = s.statfeed_counts_self.get("Shot", 0)
+    demos_s  = s.statfeed_counts_self.get("Demolish", 0)
 
     overall_rows = [
         _stat_row("Matches", matches_val),
         _stat_row("Goals", goals_val),
         _stat_row("Streak", streak_val),
-        _stat_row("Best run", f"W{s.best_win_streak}" if s.best_win_streak else f"<span style='color:{C_MUTED};'>—</span>"),
+        _stat_row("Best run", f"W{s.best_win_streak}" if s.best_win_streak else em_dash),
     ]
     play_rows = [
-        _stat_row("Saves",      _opt_int(s.statfeed_counts.get("Save", 0))),
-        _stat_row("Shots",      _opt_int(s.statfeed_counts.get("Shot", 0))),
-        _stat_row("Demos",      _opt_int(s.statfeed_counts.get("Demolish", 0))),
-        _stat_row("Crossbars",  _opt_int(s.crossbars)),
+        _stat_row("Saves",     _pair_int_self(saves_s, saves_t)),
+        _stat_row("Shots",     _pair_int_self(shots_s, shots_t)),
+        _stat_row("Demos",     _pair_int_self(demos_s, demos_t)),
+        _stat_row("Crossbars", _opt_int(s.crossbars)),
     ]
     fun_rows = [
-        _stat_row("Max goal speed",   _opt_int(s.max_goal_speed)),
-        _stat_row("Max ball speed",   _opt_int(s.max_ball_speed)),
-        _stat_row("Hardest crossbar", _opt_int(s.max_impact_force)),
-        _stat_row("Fastest goal",     _opt_float_s(s.fastest_goal_time)),
+        _stat_row("Max goal speed",   _pair_int(s.max_goal_speed, s.max_goal_speed_self)),
+        _stat_row("Max ball speed",   _pair_int(s.max_ball_speed, s.max_ball_speed_self)),
+        _stat_row("Hardest crossbar", _pair_int(s.max_impact_force, s.max_impact_force_self)),
+        _stat_row("Fastest goal",     _pair_fastest(s.fastest_goal_time, s.fastest_goal_time_self)),
     ]
 
     header = (
@@ -1180,11 +1254,25 @@ def render_session_html(s: SessionStats) -> str:
         "margin-top:8px;'>&nbsp;</div>"
         "<div style='height:6px;font-size:1px;line-height:1px;'>&nbsp;</div>"
     )
+    show_legend = (
+        s.max_goal_speed > s.max_goal_speed_self
+        or s.max_ball_speed > s.max_ball_speed_self
+        or s.max_impact_force > s.max_impact_force_self
+        or shots_t > shots_s or saves_t > saves_s or demos_t > demos_s
+    )
+    legend = ""
+    if show_legend:
+        legend = (
+            "<div style='height:8px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+            f"<div style='color:{C_MUTED};font-size:8pt;letter-spacing:0.04em;'>"
+            "Format: <b>session</b> | yours</div>"
+        )
     return (
         header
         + _stat_section("OVERALL", overall_rows)
         + _stat_section("PLAY",    play_rows)
         + _stat_section("FUN",     fun_rows)
+        + legend
     )
 
 
@@ -1226,8 +1314,14 @@ def main():
             return
         if state["session_held"]:
             overlay.set_html(render_session_html(session))
-        else:
-            overlay.set_html(state["h2h_html"])
+            overlay.show()
+            overlay.raise_()
+            return
+        # H2H is only meaningful while a real match is in progress.
+        if not state["in_match"]:
+            overlay.hide()
+            return
+        overlay.set_html(state["h2h_html"])
         overlay.show()
         overlay.raise_()
 
@@ -1268,10 +1362,17 @@ def main():
                 print(f"[self] detected self={same_side[0]['name']!r} "
                       f"({same_side[0]['key']}) — saved to config", file=sys.stderr)
                 save_config(cfg)
+        # Resolve self_name for session-stat attribution (events only carry Name).
+        self_id = cfg.get("self_player_id")
+        if self_id:
+            for p in payload["players"]:
+                if p["key"] == self_id:
+                    session.self_name = p["name"]
+                    break
         html = render_html(
             payload["players"], payload["myTeam"], payload["arena"],
             players_db, payload.get("teamColors") or {},
-            cfg.get("self_player_id"),
+            self_id,
         )
         state["h2h_html"] = html
         update_overlay()
@@ -1317,11 +1418,17 @@ def main():
         state["idle_html"] = state["h2h_html"]
         update_overlay()
 
+    def on_event_for_session(event: str, data: dict):
+        # Only count events while a real match is in progress (between match_initialized
+        # and match_ended/match_destroyed). Excludes free practice / training / menus.
+        if state["in_match"]:
+            session.on_event(event, data)
+
     stats.match_initialized.connect(on_initialized)
     stats.match_ended.connect(on_ended)
     stats.match_destroyed.connect(on_destroyed)
     stats.connection_status.connect(on_status)
-    stats.event_seen.connect(session.on_event)
+    stats.event_seen.connect(on_event_for_session)
     hotkey_h2h.pressed.connect(on_h2h_pressed)
     hotkey_h2h.released.connect(on_h2h_released)
     hotkey_session.pressed.connect(on_session_pressed)
