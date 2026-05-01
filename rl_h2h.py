@@ -289,24 +289,30 @@ def update_players_cache(players: dict, match: dict) -> None:
         my_pov = [score[my_team], score[1 - my_team]]
     else:
         my_pov = None
+    result_letter = "W" if i_won else "L"
     for p in match["players"]:
         rec = players.setdefault(p["key"], {
             "name": p["name"],
             "aliases": [p["name"]],
-            BUCKET_VS:   {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None, "lastScore": None},
-            BUCKET_WITH: {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None, "lastScore": None},
+            BUCKET_VS:   {"wins": 0, "losses": 0, "lastSeenAt": None,
+                          "lastResult": None, "lastScore": None, "recent": []},
+            BUCKET_WITH: {"wins": 0, "losses": 0, "lastSeenAt": None,
+                          "lastResult": None, "lastScore": None, "recent": []},
         })
         rec["name"] = p["name"]
         if p["name"] not in rec["aliases"]:
             rec["aliases"].append(p["name"])
-        bucket = BUCKET_WITH if p["team"] == my_team else BUCKET_VS
+        bucket = rec[BUCKET_WITH if p["team"] == my_team else BUCKET_VS]
+        bucket.setdefault("recent", [])  # back-compat for older players.json entries
         if i_won:
-            rec[bucket]["wins"] += 1
+            bucket["wins"] += 1
         else:
-            rec[bucket]["losses"] += 1
-        rec[bucket]["lastSeenAt"] = when
-        rec[bucket]["lastResult"] = "W" if i_won else "L"
-        rec[bucket]["lastScore"] = my_pov
+            bucket["losses"] += 1
+        bucket["lastSeenAt"] = when
+        bucket["lastResult"] = result_letter
+        bucket["lastScore"] = my_pov
+        bucket["recent"].append(result_letter)
+        bucket["recent"] = bucket["recent"][-5:]
 
 
 class StatsClient(QObject):
@@ -831,8 +837,8 @@ C_MUTED    = "#8E9379"  # outline
 C_FAINT    = "#444933"  # outline-variant (dividers, NEW pill border)
 C_BLUE     = "#3B9EFF"  # fallback only — wire ColorPrimary preferred
 C_ORANGE   = "#FF7A29"  # fallback only
-C_WIN      = "#D7E3F8"  # tertiary-container — cool ice-blue accent
-C_LOSS     = "#BFC7D8"  # secondary — muted for de-emphasis
+C_WIN      = "#CCFF00"  # lime — wins, streaks, +diffs, recent W pips
+C_LOSS     = "#FFDAD6"  # soft red — losses, recent L pips, negative diffs
 
 
 def idle_html(message: str) -> str:
@@ -875,6 +881,21 @@ def humanize_when(iso_ts: Optional[str]) -> str:
     return f"{secs // 86400}d ago"
 
 
+def _recent_pips(recent: list) -> str:
+    if not isinstance(recent, list) or not recent:
+        return ""
+    parts = []
+    for r in recent[-5:]:
+        color = C_WIN if r == "W" else C_LOSS
+        parts.append(f"<span style='color:{color};'>{r}</span>")
+    return (
+        "<span style='font-family:Consolas,\"SF Mono\",monospace;"
+        "font-size:8pt;font-weight:700;letter-spacing:0.16em;'>"
+        + "".join(parts)
+        + "</span>"
+    )
+
+
 def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
     rec = players_db.get(p["key"])
     bucket = BUCKET_WITH if p["team"] == my_team else BUCKET_VS
@@ -907,7 +928,8 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             f"letter-spacing:0.14em;border:1px solid {C_FAINT};"
             "padding:1px 6px;'>NEW</span>"
         )
-        sub = ""
+        sub_left = ""
+        sub_right = ""
     else:
         b = rec[bucket]
         stat_cell = (
@@ -917,29 +939,32 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             "</span>"
         )
         when = humanize_when(b["lastSeenAt"])
-        res = b["lastResult"]
         last_score = b.get("lastScore")
-        if when and res:
-            res_color = C_WIN if res == "W" else C_LOSS
+        # Left of sub-row: freshness (+ score of last match if known).
+        sub_left = ""
+        if when:
             score_part = ""
             if isinstance(last_score, list) and len(last_score) == 2:
                 score_part = (
-                    f"&nbsp;<span style='color:{C_MUTED};"
-                    "font-family:Consolas,\"SF Mono\",monospace;'>"
-                    f"({last_score[0]}&ndash;{last_score[1]})</span>"
+                    f"&nbsp;<span style='font-family:Consolas,\"SF Mono\",monospace;'>"
+                    f"{last_score[0]}&ndash;{last_score[1]}</span>"
                 )
-            sub = (
+            sub_left = (
                 f"<span style='color:{C_MUTED};font-size:8pt;'>"
-                f"{when}&nbsp;<span style='color:{res_color};font-weight:700;'>{res}</span>"
-                f"{score_part}"
-                "</span>"
+                f"{when}{score_part}</span>"
             )
-        else:
-            sub = ""
+        # Right of sub-row: last 5 W/L pips, oldest → newest, lime/red.
+        sub_right = _recent_pips(b.get("recent") or [])
 
-    sub_row = (
-        f"<tr><td colspan='2' style='padding:0 0 2px 0;'>{sub}</td></tr>" if sub else ""
-    )
+    sub_row = ""
+    if sub_left or sub_right:
+        sub_row = (
+            "<tr>"
+            f"<td align='left' style='padding:0 0 2px 0;'>{sub_left}</td>"
+            f"<td align='right' style='padding:0 0 2px 0;white-space:nowrap;'>"
+            f"{sub_right}</td>"
+            "</tr>"
+        )
     return (
         "<table width='100%' cellspacing='0' cellpadding='0' "
         "style='border-collapse:collapse;margin:0;'>"
@@ -1298,6 +1323,47 @@ def render_session_html(s: SessionStats) -> str:
     )
 
 
+def render_summary_html(payload: dict) -> str:
+    """Auto-popup card flashed for ~5s when a match ends."""
+    my_team = payload.get("myTeam")
+    winner = payload.get("winner")
+    i_won = winner == my_team
+    label = "WIN" if i_won else "LOSS"
+    accent = C_WIN if i_won else C_LOSS
+
+    score = payload.get("score")
+    if isinstance(score, list) and len(score) == 2 and isinstance(my_team, int):
+        score_html = (
+            f"<span style='font-family:Consolas,\"SF Mono\",monospace;font-size:14pt;"
+            f"font-weight:700;color:{C_TEXT};'>"
+            f"{score[my_team]}<span style='color:{C_MUTED};'>&ndash;</span>"
+            f"{score[1 - my_team]}</span>"
+        )
+    else:
+        score_html = ""
+
+    arena_label = pretty_arena(payload.get("arena") or "")
+    arena_html = ""
+    if arena_label:
+        a = arena_label if len(arena_label) <= 22 else arena_label[:21] + "…"
+        arena_html = (
+            f"<div style='color:{C_MUTED};font-size:8pt;font-weight:500;"
+            f"letter-spacing:0.10em;margin-top:6px;'>{a.upper()}</div>"
+        )
+
+    return (
+        "<table width='100%' cellspacing='0' cellpadding='0' "
+        "style='border-collapse:collapse;'>"
+        "<tr>"
+        f"<td align='left' style='color:{accent};font-size:14pt;font-weight:700;"
+        f"letter-spacing:0.18em;'>{label}</td>"
+        f"<td align='right'>{score_html}</td>"
+        "</tr>"
+        "</table>"
+        + arena_html
+    )
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -1322,28 +1388,34 @@ def main():
         "in_match": False,
         "h2h_held": False,
         "session_held": False,
+        "summary_visible": False,
+        "summary_html": "",
         "h2h_html": idle_html("Waiting for Rocket League…"),
         "idle_html": idle_html("Waiting for Rocket League…"),
     }
 
+    def _any_visible() -> bool:
+        return (state["h2h_held"] or state["session_held"]
+                or state["summary_visible"])
+
     def update_overlay():
-        held = state["h2h_held"] or state["session_held"]
-        if not held:
+        if not _any_visible():
+            focus_timer.stop()
             overlay.hide()
             return
         if cfg.get("require_rl_focus", True) and not is_rl_focused():
             overlay.hide()
             return
+        # Priority: held keys win over the auto-popup. Session > H2H > summary.
         if state["session_held"]:
             overlay.set_html(render_session_html(session))
-            overlay.show()
-            overlay.raise_()
-            return
-        # H2H is only meaningful while a real match is in progress.
-        if not state["in_match"]:
+        elif state["h2h_held"] and state["in_match"]:
+            overlay.set_html(state["h2h_html"])
+        elif state["summary_visible"]:
+            overlay.set_html(state["summary_html"])
+        else:
             overlay.hide()
             return
-        overlay.set_html(state["h2h_html"])
         overlay.show()
         overlay.raise_()
 
@@ -1358,7 +1430,7 @@ def main():
 
     def on_h2h_released():
         state["h2h_held"] = False
-        if not (state["h2h_held"] or state["session_held"]):
+        if not _any_visible():
             focus_timer.stop()
         update_overlay()
 
@@ -1369,12 +1441,19 @@ def main():
 
     def on_session_released():
         state["session_held"] = False
-        if not (state["h2h_held"] or state["session_held"]):
+        if not _any_visible():
+            focus_timer.stop()
+        update_overlay()
+
+    def hide_summary():
+        state["summary_visible"] = False
+        if not _any_visible():
             focus_timer.stop()
         update_overlay()
 
     def on_initialized(payload: dict):
         state["in_match"] = True
+        state["summary_visible"] = False  # clear stale post-match summary
         # Auto-detect self in 1v1: only one teammate on my side = me. Persist to config.
         if not cfg.get("self_player_id"):
             mt = payload["myTeam"]
@@ -1422,6 +1501,12 @@ def main():
             mt = payload["myTeam"]
             score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
+        # Auto-popup the post-match summary card for ~5 seconds.
+        state["summary_html"] = render_summary_html(payload)
+        state["summary_visible"] = True
+        focus_timer.start()
+        update_overlay()
+        QTimer.singleShot(5000, hide_summary)
 
     def on_destroyed():
         state["in_match"] = False
