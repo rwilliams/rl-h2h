@@ -210,6 +210,39 @@ Ball hit a crossbar.
 }
 ```
 
+##### Detecting own-goals
+
+The API has **no own-goal flag**. `Scorer.TeamNum` is the team of the
+player who put the ball into the net, regardless of whose net it went
+into. There are two viable derivations:
+
+1. **Score-delta (canonical, robust):** snapshot
+   `Game.Teams[i].Score` from the latest `UpdateState` at the moment
+   `GoalScored` fires, then watch the *next* `UpdateState`. Whichever
+   team's count actually went up is the beneficiary. If that's not
+   `Scorer.TeamNum`, it's an own-goal. Works on every arena (standard,
+   hoops, dropshot, snowday, labs).
+2. **Coordinate-Y (instant, arena-dependent):** in standard arenas
+   Blue's net is at `Y ≈ −5120` and Orange's at `Y ≈ +5120`. So
+   `ImpactLocation.Y < 0` means Orange scored (or Blue own-goaled);
+   `Y > 0` means Blue scored (or Orange own-goaled). Compare to
+   `Scorer.TeamNum`. Faster than #1 (no waiting) but assumes the Y-axis
+   convention, which can break on non-standard layouts.
+
+Note that `GoalScored` and the corresponding score-bumped `UpdateState`
+can arrive in either order, so a **deferred-attribution queue** is the
+clean implementation: queue every `GoalScored` with its
+score-snapshot at queue time, drain on every `UpdateState` (and on
+`MatchEnded`/`MatchDestroyed`), and emit the enriched event with a
+synthetic `bOwnGoal: bool` field. This is what `rl_h2h.py` does in
+`StatsClient._drain_pending_goals`.
+
+Edge case: two goals in the same `UpdateState` window (rare, possible at
+low `PacketSendRate`) are ambiguous via score-delta alone — both teams'
+scores went up. The pragmatic fallback is to default to
+`bOwnGoal=False` for these pile-ups; the coordinate-Y check could
+disambiguate but adds complexity for a corner case.
+
 #### `StatfeedEvent`
 Fires whenever a player earns a stat (demos, saves, etc).
 
