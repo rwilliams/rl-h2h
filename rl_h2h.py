@@ -1152,7 +1152,8 @@ class SessionStats:
         self.max_impact_force_self = 0.0
         self.fastest_goal_time: Optional[float] = None
         self.fastest_goal_time_self: Optional[float] = None
-        self.own_goals = 0  # times you put the ball in your own team's net
+        self.own_goals = 0       # any cross-team last-touch this session
+        self.own_goals_self = 0  # when *you* were the last touch
         self.statfeed_counts: dict[str, int] = {}
         self.statfeed_counts_self: dict[str, int] = {}
 
@@ -1164,13 +1165,10 @@ class SessionStats:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
             if data.get("bOwnGoal"):
-                # Only count "own goals" where you were the last to touch the
-                # ball. Cross-team last-touches where the *opponent* deflected
-                # an attacker's shot in are also flagged bOwnGoal but read as
-                # normal goals from your perspective.
+                self.own_goals += 1
                 last_name, _ = _last_touch_player(data)
                 if self._is_self(last_name):
-                    self.own_goals += 1
+                    self.own_goals_self += 1
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 if sp > self.max_goal_speed:
@@ -1399,7 +1397,7 @@ def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
         _stat_row("Max ball speed",   _pair_max(s.max_ball_speed, s.max_ball_speed_self)),
         _stat_row("Hardest crossbar", _pair_max(s.max_impact_force, s.max_impact_force_self)),
         _stat_row("Fastest goal",     _pair_fastest(s.fastest_goal_time, s.fastest_goal_time_self)),
-        _stat_row("Own goals",        _opt_int(s.own_goals)),
+        _stat_row("Own goals",        _pair_count(s.own_goals, s.own_goals_self)),
     ]
 
     header = (
@@ -1472,6 +1470,7 @@ class MatchStats:
         self.fastest_goal_time: Optional[float] = None
         self.fastest_goal_time_self: Optional[float] = None
         self.own_goals = 0
+        self.own_goals_self = 0
 
     def _is_self(self, name) -> bool:
         return bool(name) and name == self.self_name
@@ -1481,9 +1480,10 @@ class MatchStats:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
             if data.get("bOwnGoal"):
+                self.own_goals += 1
                 last_name, _ = _last_touch_player(data)
                 if self._is_self(last_name):
-                    self.own_goals += 1
+                    self.own_goals_self += 1
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 self.max_goal_speed = max(self.max_goal_speed, float(sp))
@@ -1562,6 +1562,7 @@ def _session_has_split(s: SessionStats) -> bool:
         s.max_goal_speed > s.max_goal_speed_self
         or s.max_ball_speed > s.max_ball_speed_self
         or s.max_impact_force > s.max_impact_force_self
+        or s.own_goals > s.own_goals_self
         or s.statfeed_counts.get(SF_SAVE, 0) > s.statfeed_counts_self.get(SF_SAVE, 0)
         or s.statfeed_counts.get(SF_SHOT, 0) > s.statfeed_counts_self.get(SF_SHOT, 0)
         or s.statfeed_counts.get(SF_DEMOLISH, 0) > s.statfeed_counts_self.get(SF_DEMOLISH, 0)
@@ -1700,7 +1701,8 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
         fun_rows.append(_stat_row("Fastest goal",
                                   _pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self, always_pair=True)))
     if ms.own_goals > 0:
-        fun_rows.append(_stat_row("Own goals", _opt_int(ms.own_goals)))
+        fun_rows.append(_stat_row("Own goals",
+                                  _pair_count(ms.own_goals, ms.own_goals_self, always_pair=True)))
 
     body = ""
     if play_rows:
