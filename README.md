@@ -28,6 +28,8 @@ python rl_h2h.py
 
 Or double-click `start.bat` for a windowless launch. The script can be started before or after Rocket League — it auto-reconnects.
 
+A small **`H` icon appears in the Windows system tray** (notification area, bottom-right). Right-click it for a menu: connection status, "Open data folder", and **Quit**. If you don't see it, expand the chevron `^` next to the clock — Windows hides new tray icons by default. You can pin it: drag the icon onto the taskbar.
+
 To update later: `git pull`.
 
 ## Hotkeys (defaults)

@@ -20,8 +20,8 @@ from typing import Optional
 
 import websockets
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtGui import QAction, QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 from pynput import keyboard
 
 
@@ -1380,6 +1380,22 @@ class MatchStats:
                 self.demos_received += 1
 
 
+def make_tray_icon() -> QIcon:
+    """Programmatic tray icon — dark circle with a lime 'H' (Head-to-head)."""
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor("#101415"))
+    p.setPen(QPen(QColor(C_WIN), 2))
+    p.drawEllipse(2, 2, 28, 28)
+    p.setPen(QColor(C_WIN))
+    p.setFont(QFont("Segoe UI", 13, QFont.Bold))
+    p.drawText(pix.rect(), Qt.AlignCenter, "H")
+    p.end()
+    return QIcon(pix)
+
+
 def render_summary_html(payload: dict, ms: "MatchStats") -> str:
     """Auto-popup card flashed for ~5s when a match ends. Result + score + per-match stats."""
     my_team = payload.get("myTeam")
@@ -1623,6 +1639,57 @@ def main():
     hotkey_h2h.released.connect(on_h2h_released)
     hotkey_session.pressed.connect(on_session_pressed)
     hotkey_session.released.connect(on_session_released)
+
+    # System tray icon — gives the user a way to quit when launched via start.bat
+    # (which uses pythonw and so has no console window to Ctrl+C).
+    tray = None
+    status_action = None
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray = QSystemTrayIcon(make_tray_icon())
+        tray.setToolTip("Rocket League H2H — starting…")
+
+        menu = QMenu()
+        title_action = QAction("Rocket League H2H")
+        title_action.setEnabled(False)
+        menu.addAction(title_action)
+        status_action = QAction("Status: starting…")
+        status_action.setEnabled(False)
+        menu.addAction(status_action)
+        menu.addSeparator()
+
+        open_action = QAction("Open data folder")
+        def _open_folder():
+            try:
+                if sys.platform == "win32":
+                    os.startfile(str(APP_DIR))  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    import subprocess
+                    subprocess.Popen(["open", str(APP_DIR)])
+                else:
+                    import subprocess
+                    subprocess.Popen(["xdg-open", str(APP_DIR)])
+            except Exception as e:
+                print(f"[tray] open folder failed: {e}", file=sys.stderr)
+        open_action.triggered.connect(_open_folder)
+        menu.addAction(open_action)
+        menu.addSeparator()
+
+        quit_action = QAction("Quit")
+        quit_action.triggered.connect(app.quit)
+        menu.addAction(quit_action)
+
+        tray.setContextMenu(menu)
+        tray.show()
+
+        def update_tray_status(connected: bool):
+            label = "Connected" if connected else "Disconnected"
+            if status_action is not None:
+                status_action.setText(f"Status: {label}")
+            tray.setToolTip(f"Rocket League H2H — {label}")
+        stats.connection_status.connect(update_tray_status)
+    else:
+        print("[tray] system tray not available; quit via Task Manager / Ctrl+C",
+              file=sys.stderr)
 
     stats.start()
     hotkey_h2h.start()
