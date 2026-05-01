@@ -1641,21 +1641,19 @@ def main():
         if state["session_held"]:
             overlay.set_html(render_session_html(session))
         elif state["h2h_held"] and state["in_match"]:
-            hint = hotkey_hint_html(cfg, state["h2h_expanded"])
             if state["h2h_expanded"]:
-                # Qt RichText doesn't reliably honor `height` on `<div>` (block size
-                # follows content) and `bgcolor` cells ignore `height='1'` (clamped to a
-                # ~12px minimum, which paints an ugly olive bar). A single empty cell at
-                # the desired pixel height is the only thing that renders cleanly.
+                # In expanded mode the session card's own 'Format | session | yours' legend
+                # already sits at the bottom of the overlay — adding the hotkey hint below
+                # it stacks two metadata rows too close together (Qt's native block
+                # spacing fights us). Show the hint only in compact mode, where the
+                # session card isn't rendered.
                 spacer = (
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
                     "<tr><td height='28'>&nbsp;</td></tr></table>"
                 )
-                overlay.set_html(
-                    state["h2h_html"] + spacer + render_session_html(session) + hint
-                )
+                overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
             else:
-                overlay.set_html(state["h2h_html"] + hint)
+                overlay.set_html(state["h2h_html"] + hotkey_hint_html(cfg, expanded=False))
         elif state["summary_visible"]:
             overlay.set_html(state["summary_html"])
         else:
