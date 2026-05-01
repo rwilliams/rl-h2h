@@ -156,12 +156,23 @@ DEFAULT_CONFIG = {
         "Gamepad bindings require: pip install inputs",
         "Note: stock RL maps D-pad directions to quickchat. To avoid sending a quickchat",
         "      every time you check the overlay, prefer 'pad_lb' (default scoreboard).",
-        "require_rl_focus:   only show the overlay when Rocket League has focus (Windows).",
-        "show_match_summary: flash a 5-second result + per-match stats card when a match",
-        "                    ends. Set to false to disable.",
-        "self_player_id:     auto-filled after your first 1v1 match — used to hide your own",
-        "                    W/L stat row. Set manually if you only play 2v2/3v3.",
-        "position: top-left | top-center | top-right | bottom-left | bottom-right"
+        "require_rl_focus:      only show the overlay when Rocket League has focus (Windows).",
+        "show_match_summary:    flash a result + per-match stats card when a match ends.",
+        "match_summary_seconds: max time the popup stays visible (auto-hides earlier when",
+        "                       the next match starts or you leave to the menu).",
+        "self_player_id:        auto-filled after your first 1v1 — used to hide your own W/L row.",
+        "                       Set manually if you only play 2v2/3v3.",
+        "recent_size:           number of recent W/L pips shown in the session card (default 5).",
+        "name_max_length:       player name truncation length in the H2H card (default 16).",
+        "position: top-left | top-center | top-right | bottom-left | bottom-right",
+        "colors: override any overlay color (hex strings). All keys are optional.",
+        "  win:   positive accent (wins, +diffs, your YOU tag, recent W pips)",
+        "  loss:  negative accent (losses, recent L pips)",
+        "  dim:   secondary text (sub-rows, last-played hint)",
+        "  muted: tertiary text (separators, score em-dashes)",
+        "  faint: dividers and the NEW pill border",
+        "  team_blue_fallback / team_orange_fallback: used only when the wire reports gray",
+        "         (private/training matches don't supply real ColorPrimary values)."
     ],
     "host": "127.0.0.1",
     "port": 49123,
@@ -169,14 +180,28 @@ DEFAULT_CONFIG = {
     "session_hotkeys": ["f12"],
     "require_rl_focus": True,
     "show_match_summary": True,
+    "match_summary_seconds": 30,
     "self_player_id": None,
+    "recent_size": 5,
+    "name_max_length": 16,
     "position": "top-right",
     "margin": 24,
     "width": 380,
     "background_rgba": [16, 20, 21, 200],
+    "border_radius_px": 4,
+    "border_rgba": [255, 255, 255, 28],
     "text_color": "#E0E3E5",
     "font_family": "Segoe UI",
     "font_size": 11,
+    "colors": {
+        "win":                  "#CCFF00",
+        "loss":                 "#FFDAD6",
+        "dim":                  "#C4C9AC",
+        "muted":                "#8E9379",
+        "faint":                "#444933",
+        "team_blue_fallback":   "#3B9EFF",
+        "team_orange_fallback": "#FF7A29",
+    },
 }
 
 
@@ -736,13 +761,15 @@ class Overlay(QWidget):
         self._label.setWordWrap(True)
         self._label.setFont(QFont(cfg["font_family"], cfg["font_size"]))
         self._label.setFixedWidth(cfg["width"])
-        rgba = ",".join(str(v) for v in cfg["background_rgba"])
+        bg_rgba = ",".join(str(v) for v in cfg.get("background_rgba") or [16, 20, 21, 200])
+        border_rgba = ",".join(str(v) for v in cfg.get("border_rgba") or [255, 255, 255, 28])
+        radius = int(cfg.get("border_radius_px", 4))
         self._label.setStyleSheet(
             "QLabel {"
             f"  color: {cfg['text_color']};"
-            f"  background-color: rgba({rgba});"
-            "  border: 1px solid rgba(255, 255, 255, 28);"
-            "  border-radius: 4px;"
+            f"  background-color: rgba({bg_rgba});"
+            f"  border: 1px solid rgba({border_rgba});"
+            f"  border-radius: {radius}px;"
             "  padding: 14px 16px 16px 16px;"
             "}"
         )
@@ -781,8 +808,9 @@ class Overlay(QWidget):
 
 # ---- Visual layer ----
 
-# Palette mapped from DESIGN(1).md, restricted to primary/secondary/tertiary tokens
-# (no lime/gold primary-container — user pref).
+# Palette baseline. Each constant can be overridden via cfg["colors"]; see
+# apply_color_overrides() in main(). Layout helpers also reference these via
+# EM_DASH / _PAIR_SEP, which are recomputed when the palette changes.
 C_TEXT     = "#E0E3E5"  # on-surface
 C_DIM      = "#C4C9AC"  # on-surface-variant
 C_MUTED    = "#8E9379"  # outline
@@ -791,6 +819,9 @@ C_BLUE     = "#3B9EFF"  # fallback only — wire ColorPrimary preferred
 C_ORANGE   = "#FF7A29"  # fallback only
 C_WIN      = "#CCFF00"  # lime — wins, streaks, +diffs, recent W pips
 C_LOSS     = "#FFDAD6"  # soft red — losses, recent L pips, negative diffs
+
+# Player name truncation in the H2H card (overridable via cfg["name_max_length"]).
+NAME_MAX_LEN = 16
 
 
 def idle_html(message: str) -> str:
@@ -852,8 +883,8 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
     rec = players_db.get(p["key"])
     bucket = BUCKET_WITH if p["team"] == my_team else BUCKET_VS
     name = p["name"]
-    if len(name) > 16:
-        name = name[:15] + "…"
+    if len(name) > NAME_MAX_LEN:
+        name = name[:NAME_MAX_LEN - 1] + "…"
     is_self = self_id is not None and p["key"] == self_id
 
     if is_self:
@@ -1014,7 +1045,8 @@ def render_html(roster: list[dict], my_team: int, arena: str,
 class SessionStats:
     """Aggregates stats from script start until kill. Updated from StatsClient signals."""
 
-    def __init__(self):
+    def __init__(self, recent_size: int = 5):
+        self._recent_size = max(1, int(recent_size))
         self.self_name: Optional[str] = None
         self.reset()
 
@@ -1027,7 +1059,7 @@ class SessionStats:
         self.win_streak = 0
         self.loss_streak = 0
         self.best_win_streak = 0
-        self.recent: deque = deque(maxlen=5)  # session-only last 5 results (W/L)
+        self.recent: deque = deque(maxlen=self._recent_size)  # session-only W/L
         self.goals_for = 0
         self.goals_against = 0
         self.crossbars = 0
@@ -1182,6 +1214,40 @@ def _pair_fastest(scope_v: Optional[float], self_v: Optional[float]) -> str:
         return f"{scope_v:.1f}s"
     right = f"{self_v:.1f}s" if self_v else EM_DASH
     return f"{scope_v:.1f}s{_PAIR_SEP}{right}"
+
+
+def apply_overrides(cfg: dict) -> None:
+    """Patch palette + truncation globals from cfg. Called once at startup.
+
+    Color constants are referenced directly inside render functions, so the cleanest
+    way to honor user overrides is to mutate the module globals before any rendering
+    happens. EM_DASH / _PAIR_SEP also need to be recomputed because they bake C_MUTED
+    in at import time.
+    """
+    global C_TEXT, C_DIM, C_MUTED, C_FAINT, C_BLUE, C_ORANGE, C_WIN, C_LOSS
+    global EM_DASH, _PAIR_SEP, NAME_MAX_LEN
+    palette = cfg.get("colors") or {}
+    if isinstance(cfg.get("text_color"), str):
+        C_TEXT = cfg["text_color"]
+    if isinstance(palette.get("dim"), str):
+        C_DIM = palette["dim"]
+    if isinstance(palette.get("muted"), str):
+        C_MUTED = palette["muted"]
+    if isinstance(palette.get("faint"), str):
+        C_FAINT = palette["faint"]
+    if isinstance(palette.get("win"), str):
+        C_WIN = palette["win"]
+    if isinstance(palette.get("loss"), str):
+        C_LOSS = palette["loss"]
+    if isinstance(palette.get("team_blue_fallback"), str):
+        C_BLUE = palette["team_blue_fallback"]
+    if isinstance(palette.get("team_orange_fallback"), str):
+        C_ORANGE = palette["team_orange_fallback"]
+    EM_DASH = f"<span style='color:{C_MUTED};'>—</span>"
+    _PAIR_SEP = f"<span style='color:{C_MUTED};font-weight:500;'>&nbsp;|&nbsp;</span>"
+    nml = cfg.get("name_max_length")
+    if isinstance(nml, int) and nml > 0:
+        NAME_MAX_LEN = nml
 
 
 def render_session_html(s: SessionStats) -> str:
@@ -1477,6 +1543,7 @@ def main():
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     cfg = load_config()
+    apply_overrides(cfg)
     players_db = load_players()
 
     app = QApplication(sys.argv)
@@ -1484,7 +1551,7 @@ def main():
 
     overlay = Overlay(cfg)
     stats = StatsClient(cfg["host"], cfg["port"])
-    session = SessionStats()
+    session = SessionStats(recent_size=cfg.get("recent_size", 5))
     match_stats = MatchStats()
     hotkey_h2h = HotkeyManager(cfg["hotkeys"])
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
@@ -1621,7 +1688,7 @@ def main():
             state["summary_visible"] = True
             focus_timer.start()
             update_overlay()
-            summary_timer.start(30000)
+            summary_timer.start(int(cfg.get("match_summary_seconds", 30)) * 1000)
 
     def on_destroyed():
         state["in_match"] = False
