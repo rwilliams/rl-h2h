@@ -8,16 +8,18 @@ while the configured hotkey is held.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import sys
 import threading
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import websockets
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QFont, QGuiApplication
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 from pynput import keyboard
@@ -139,21 +141,31 @@ GAMEPAD_TRIGGER_THRESHOLD = 80  # 0..255
 
 DEFAULT_CONFIG = {
     "_comments": [
-        "hotkeys: list of triggers that show the overlay while held.",
-        "Keyboard: 'tab', 'f1', 'f2', 'caps_lock', 'shift', 'esc', 'space', or a single char like 'h'.",
+        "hotkeys:         held to show the head-to-head overlay (per-opponent W/L).",
+        "session_hotkeys: held to show the current-session stats overlay.",
+        "Keyboard names:  'tab', 'f1'..'f12', 'caps_lock', 'shift', 'esc', 'space',",
+        "                 or a single character like 'h'.",
         "Gamepad (Xbox / PlayStation), prefix with 'pad_':",
         "  Buttons:  pad_a (Xbox A / PS X), pad_b (B / Circle), pad_x (X / Square), pad_y (Y / Triangle)",
         "  Bumpers:  pad_lb (LB / L1), pad_rb (RB / R1)",
         "  Triggers: pad_lt (LT / L2), pad_rt (RT / R2)",
         "  D-pad:    pad_dpad_up, pad_dpad_down, pad_dpad_left, pad_dpad_right",
-        "  Other:    pad_back (Xbox View / PS Share), pad_start (Menu / Options),",
-        "            pad_lstick (left stick click), pad_rstick (right stick click)",
+        "  Other:    pad_back (Xbox View / PS Share — default scoreboard button),",
+        "            pad_start (Menu / Options), pad_lstick, pad_rstick",
         "Gamepad bindings require: pip install inputs",
+        "Note: stock RL maps D-pad directions to quickchat. To avoid sending a quickchat",
+        "      every time you check the overlay, use 'pad_back' on controller.",
+        "require_rl_focus: only show the overlay when Rocket League has focus (Windows).",
+        "self_player_id:   auto-filled after your first 1v1 match — used to hide your own",
+        "                  W/L stat row. Set manually if you only play 2v2/3v3.",
         "position: top-left | top-center | top-right | bottom-left | bottom-right"
     ],
     "host": "127.0.0.1",
     "port": 49123,
-    "hotkeys": ["tab", "pad_dpad_down"],
+    "hotkeys": ["tab", "pad_back"],
+    "session_hotkeys": ["f12"],
+    "require_rl_focus": True,
+    "self_player_id": None,
     "position": "top-right",
     "margin": 24,
     "width": 380,
@@ -164,10 +176,45 @@ DEFAULT_CONFIG = {
 }
 
 
+def is_rl_focused() -> bool:
+    """True when Rocket League is the foreground window. Always True on non-Windows."""
+    if sys.platform != "win32":
+        return True
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h_proc = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h_proc:
+            return False
+        try:
+            buf = (ctypes.c_wchar * 260)()
+            size = wintypes.DWORD(260)
+            if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                return buf.value.lower().endswith("rocketleague.exe")
+        finally:
+            kernel32.CloseHandle(h_proc)
+    except Exception:
+        return False
+    return False
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def save_config(cfg: dict) -> None:
+    out = {k: v for k, v in cfg.items() if k != "hotkey"}
+    try:
+        atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2))
+    except Exception as e:
+        print(f"[config] could not save: {e}", file=sys.stderr)
 
 
 def load_config() -> dict:
@@ -273,6 +320,7 @@ class StatsClient(QObject):
     match_ended = Signal(dict)
     match_destroyed = Signal()
     connection_status = Signal(bool)
+    event_seen = Signal(str, dict)  # raw event name + decoded data, for downstream consumers
 
     def __init__(self, host: str, port: int):
         super().__init__()
@@ -428,6 +476,8 @@ class StatsClient(QObject):
                 data = {}
         if not isinstance(data, dict):
             data = {}
+        if event:
+            self.event_seen.emit(event, data)
         if event == EVT_UPDATE_STATE:
             self._on_update_state(data)
         elif event == EVT_MATCH_CREATED:
@@ -804,12 +854,31 @@ def humanize_when(iso_ts: Optional[str]) -> str:
     return f"{secs // 86400}d ago"
 
 
-def _player_row(p: dict, my_team: int, players_db: dict) -> str:
+def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
     rec = players_db.get(p["key"])
     bucket = BUCKET_WITH if p["team"] == my_team else BUCKET_VS
     name = p["name"]
     if len(name) > 16:
         name = name[:15] + "…"
+    is_self = self_id is not None and p["key"] == self_id
+
+    if is_self:
+        stat_cell = (
+            f"<span style='color:{C_DIM};font-size:8pt;font-weight:700;"
+            "letter-spacing:0.16em;'>YOU</span>"
+        )
+        sub_row = ""
+        return (
+            "<table width='100%' cellspacing='0' cellpadding='0' "
+            "style='border-collapse:collapse;margin:0;'>"
+            "<tr>"
+            f"<td align='left' style='color:{C_TEXT};font-size:10pt;font-weight:600;"
+            f"padding:3px 0 0 0;'>{name}</td>"
+            "<td align='right' style='padding:3px 0 0 0;white-space:nowrap;'>"
+            f"{stat_cell}</td>"
+            "</tr>"
+            "</table>"
+        )
 
     if not rec or (rec[bucket]["wins"] == 0 and rec[bucket]["losses"] == 0):
         stat_cell = (
@@ -864,7 +933,8 @@ def _player_row(p: dict, my_team: int, players_db: dict) -> str:
     )
 
 
-def _team_section(label: str, color: str, players: list, is_you: bool, my_team: int, players_db: dict) -> str:
+def _team_section(label: str, color: str, players: list, is_you: bool,
+                  my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
     bar_color = color if is_you else C_FAINT
     label_color = C_TEXT if is_you else C_DIM
     you_tag = (
@@ -886,7 +956,7 @@ def _team_section(label: str, color: str, players: list, is_you: bool, my_team: 
     )
 
     if players:
-        body = "".join(_player_row(p, my_team, players_db) for p in players)
+        body = "".join(_player_row(p, my_team, players_db, self_id) for p in players)
         body_block = (
             "<table width='100%' cellspacing='0' cellpadding='0' "
             "style='border-collapse:collapse;'>"
@@ -906,7 +976,8 @@ def _team_section(label: str, color: str, players: list, is_you: bool, my_team: 
 
 
 def render_html(roster: list[dict], my_team: int, arena: str,
-                players_db: dict, team_colors: dict) -> str:
+                players_db: dict, team_colors: dict,
+                self_id: Optional[str] = None) -> str:
     blue = sorted([p for p in roster if p["team"] == 0], key=lambda x: x["name"].lower())
     orange = sorted([p for p in roster if p["team"] == 1], key=lambda x: x["name"].lower())
 
@@ -943,9 +1014,177 @@ def render_html(roster: list[dict], my_team: int, arena: str,
     spacer = "<div style='height:10px;font-size:1px;line-height:1px;'>&nbsp;</div>"
     return (
         header
-        + _team_section("BLUE",   blue_color,   blue,   my_team == 0, my_team, players_db)
+        + _team_section("BLUE",   blue_color,   blue,   my_team == 0, my_team, players_db, self_id)
         + spacer
-        + _team_section("ORANGE", orange_color, orange, my_team == 1, my_team, players_db)
+        + _team_section("ORANGE", orange_color, orange, my_team == 1, my_team, players_db, self_id)
+    )
+
+
+class SessionStats:
+    """Aggregates stats from script start until kill. Updated from StatsClient signals."""
+
+    def __init__(self):
+        self.started_at = datetime.now(timezone.utc)
+        self.matches = 0
+        self.wins = 0
+        self.losses = 0
+        self.win_streak = 0
+        self.loss_streak = 0
+        self.best_win_streak = 0
+        self.goals_for = 0
+        self.goals_against = 0
+        self.crossbars = 0
+        self.max_goal_speed = 0.0
+        self.max_ball_speed = 0.0
+        self.max_impact_force = 0.0
+        self.fastest_goal_time: Optional[float] = None
+        self.statfeed_counts: dict[str, int] = {}
+
+    def on_event(self, event: str, data: dict) -> None:
+        if event == "GoalScored":
+            sp = data.get("GoalSpeed")
+            if isinstance(sp, (int, float)):
+                self.max_goal_speed = max(self.max_goal_speed, float(sp))
+            gt = data.get("GoalTime")
+            if isinstance(gt, (int, float)):
+                if self.fastest_goal_time is None or gt < self.fastest_goal_time:
+                    self.fastest_goal_time = float(gt)
+        elif event == "CrossbarHit":
+            self.crossbars += 1
+            ifo = data.get("ImpactForce")
+            if isinstance(ifo, (int, float)):
+                self.max_impact_force = max(self.max_impact_force, float(ifo))
+        elif event == "BallHit":
+            ball = data.get("Ball")
+            if isinstance(ball, dict):
+                sp = ball.get("PostHitSpeed")
+                if isinstance(sp, (int, float)):
+                    self.max_ball_speed = max(self.max_ball_speed, float(sp))
+        elif event == "StatfeedEvent":
+            ev_name = data.get("EventName")
+            if isinstance(ev_name, str) and ev_name:
+                self.statfeed_counts[ev_name] = self.statfeed_counts.get(ev_name, 0) + 1
+
+    def on_match_ended(self, payload: dict) -> None:
+        self.matches += 1
+        i_won = payload["winner"] == payload["myTeam"]
+        if i_won:
+            self.wins += 1
+            self.win_streak += 1
+            self.loss_streak = 0
+            self.best_win_streak = max(self.best_win_streak, self.win_streak)
+        else:
+            self.losses += 1
+            self.loss_streak += 1
+            self.win_streak = 0
+        score = payload.get("score")
+        if isinstance(score, list) and len(score) == 2:
+            mt = payload["myTeam"]
+            self.goals_for += score[mt]
+            self.goals_against += score[1 - mt]
+
+
+def _stat_row(label: str, value: str, accent: Optional[str] = None) -> str:
+    val_color = accent or C_TEXT
+    return (
+        "<table width='100%' cellspacing='0' cellpadding='0' "
+        "style='border-collapse:collapse;margin:0;'>"
+        "<tr>"
+        f"<td align='left' style='color:{C_DIM};font-size:9pt;padding:2px 0 2px 0;'>{label}</td>"
+        f"<td align='right' style='color:{val_color};font-size:10pt;font-weight:600;"
+        "font-family:Consolas,\"SF Mono\",monospace;"
+        f"padding:2px 0 2px 0;white-space:nowrap;'>{value}</td>"
+        "</tr>"
+        "</table>"
+    )
+
+
+def _stat_section(title: str, rows: list[str]) -> str:
+    header = (
+        f"<div style='color:{C_DIM};font-size:9pt;font-weight:700;letter-spacing:0.16em;"
+        "margin-top:6px;'>" + title + "</div>"
+        f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;line-height:1px;"
+        "margin-top:4px;margin-bottom:4px;'>&nbsp;</div>"
+    )
+    return header + "".join(rows)
+
+
+def render_session_html(s: SessionStats) -> str:
+    elapsed = int((datetime.now(timezone.utc) - s.started_at).total_seconds())
+    h, rem = divmod(elapsed, 3600)
+    m = rem // 60
+    duration = f"{h}h {m:02d}m" if h else f"{m}m"
+
+    win_pct = (s.wins / s.matches * 100.0) if s.matches else 0.0
+    matches_val = (
+        f"<b>{s.wins}</b><span style='color:{C_MUTED};'>&ndash;</span>"
+        f"<b>{s.losses}</b>"
+        f" <span style='color:{C_MUTED};font-weight:500;'>({win_pct:.0f}%)</span>"
+        if s.matches
+        else f"<span style='color:{C_MUTED};'>—</span>"
+    )
+
+    if s.win_streak >= 2:
+        streak_val = f"<span style='color:{C_WIN};font-weight:700;'>W{s.win_streak}</span>"
+    elif s.loss_streak >= 2:
+        streak_val = f"<span style='color:{C_LOSS};font-weight:700;'>L{s.loss_streak}</span>"
+    else:
+        streak_val = f"<span style='color:{C_MUTED};'>—</span>"
+
+    goals_val = (
+        f"{s.goals_for}<span style='color:{C_MUTED};'>&ndash;</span>{s.goals_against}"
+        if s.matches else f"<span style='color:{C_MUTED};'>—</span>"
+    )
+    diff = s.goals_for - s.goals_against
+    if diff != 0:
+        sign = "+" if diff > 0 else ""
+        diff_color = C_WIN if diff > 0 else C_LOSS
+        goals_val += f" <span style='color:{diff_color};font-size:9pt;'>{sign}{diff}</span>"
+
+    def _opt_int(v):
+        return str(int(v)) if v else f"<span style='color:{C_MUTED};'>—</span>"
+
+    def _opt_float_s(v):
+        return f"{v:.1f}s" if v is not None else f"<span style='color:{C_MUTED};'>—</span>"
+
+    overall_rows = [
+        _stat_row("Matches", matches_val),
+        _stat_row("Goals", goals_val),
+        _stat_row("Streak", streak_val),
+        _stat_row("Best run", f"W{s.best_win_streak}" if s.best_win_streak else f"<span style='color:{C_MUTED};'>—</span>"),
+    ]
+    play_rows = [
+        _stat_row("Saves",      _opt_int(s.statfeed_counts.get("Save", 0))),
+        _stat_row("Shots",      _opt_int(s.statfeed_counts.get("Shot", 0))),
+        _stat_row("Demos",      _opt_int(s.statfeed_counts.get("Demolish", 0))),
+        _stat_row("Crossbars",  _opt_int(s.crossbars)),
+    ]
+    fun_rows = [
+        _stat_row("Max goal speed",   _opt_int(s.max_goal_speed)),
+        _stat_row("Max ball speed",   _opt_int(s.max_ball_speed)),
+        _stat_row("Hardest crossbar", _opt_int(s.max_impact_force)),
+        _stat_row("Fastest goal",     _opt_float_s(s.fastest_goal_time)),
+    ]
+
+    header = (
+        "<table width='100%' cellspacing='0' cellpadding='0' "
+        "style='border-collapse:collapse;'>"
+        "<tr>"
+        f"<td align='left' style='color:{C_TEXT};font-size:10pt;font-weight:700;"
+        "letter-spacing:0.18em;'>SESSION</td>"
+        f"<td align='right' style='color:{C_MUTED};font-size:8pt;font-weight:500;"
+        f"letter-spacing:0.10em;'>{duration.upper()}</td>"
+        "</tr>"
+        "</table>"
+        f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;line-height:1px;"
+        "margin-top:8px;'>&nbsp;</div>"
+        "<div style='height:6px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+    )
+    return (
+        header
+        + _stat_section("OVERALL", overall_rows)
+        + _stat_section("PLAY",    play_rows)
+        + _stat_section("FUN",     fun_rows)
     )
 
 
@@ -965,21 +1204,82 @@ def main():
 
     overlay = Overlay(cfg)
     stats = StatsClient(cfg["host"], cfg["port"])
-    hotkey = HotkeyManager(cfg["hotkeys"])
+    session = SessionStats()
+    hotkey_h2h = HotkeyManager(cfg["hotkeys"])
+    hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
 
-    state = {"in_match": False}
+    state = {
+        "in_match": False,
+        "h2h_held": False,
+        "session_held": False,
+        "h2h_html": idle_html("Waiting for Rocket League…"),
+        "idle_html": idle_html("Waiting for Rocket League…"),
+    }
+
+    def update_overlay():
+        held = state["h2h_held"] or state["session_held"]
+        if not held:
+            overlay.hide()
+            return
+        if cfg.get("require_rl_focus", True) and not is_rl_focused():
+            overlay.hide()
+            return
+        if state["session_held"]:
+            overlay.set_html(render_session_html(session))
+        else:
+            overlay.set_html(state["h2h_html"])
+        overlay.show()
+        overlay.raise_()
+
+    focus_timer = QTimer()
+    focus_timer.setInterval(250)
+    focus_timer.timeout.connect(update_overlay)
+
+    def on_h2h_pressed():
+        state["h2h_held"] = True
+        focus_timer.start()
+        update_overlay()
+
+    def on_h2h_released():
+        state["h2h_held"] = False
+        if not (state["h2h_held"] or state["session_held"]):
+            focus_timer.stop()
+        update_overlay()
+
+    def on_session_pressed():
+        state["session_held"] = True
+        focus_timer.start()
+        update_overlay()
+
+    def on_session_released():
+        state["session_held"] = False
+        if not (state["h2h_held"] or state["session_held"]):
+            focus_timer.stop()
+        update_overlay()
 
     def on_initialized(payload: dict):
         state["in_match"] = True
+        # Auto-detect self in 1v1: only one teammate on my side = me. Persist to config.
+        if not cfg.get("self_player_id"):
+            mt = payload["myTeam"]
+            same_side = [p for p in payload["players"] if p["team"] == mt]
+            if len(same_side) == 1:
+                cfg["self_player_id"] = same_side[0]["key"]
+                print(f"[self] detected self={same_side[0]['name']!r} "
+                      f"({same_side[0]['key']}) — saved to config", file=sys.stderr)
+                save_config(cfg)
         html = render_html(
             payload["players"], payload["myTeam"], payload["arena"],
             players_db, payload.get("teamColors") or {},
+            cfg.get("self_player_id"),
         )
-        overlay.set_html(html)
+        state["h2h_html"] = html
+        update_overlay()
         print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
 
     def on_ended(payload: dict):
         state["in_match"] = False
+        session.on_match_ended(payload)
         i_won = payload["winner"] == payload["myTeam"]
         record = {
             "matchGuid": payload.get("matchGuid"),
@@ -1002,41 +1302,46 @@ def main():
 
     def on_destroyed():
         state["in_match"] = False
-        overlay.set_html(idle_html("Waiting for next match…"))
+        state["h2h_html"] = idle_html("Waiting for next match…")
+        state["idle_html"] = state["h2h_html"]
+        update_overlay()
 
     def on_status(connected: bool):
         if state["in_match"]:
             return
         if connected:
-            overlay.set_html(idle_html("Connected — waiting for match…"))
+            state["h2h_html"] = idle_html("Connected — waiting for match…")
         else:
-            overlay.set_html(idle_html("Disconnected — is RL running with the Stats API enabled?"))
-
-    def on_press():
-        overlay.show()
-        overlay.raise_()
-
-    def on_release():
-        overlay.hide()
+            state["h2h_html"] = idle_html(
+                "Disconnected — is RL running with the Stats API enabled?")
+        state["idle_html"] = state["h2h_html"]
+        update_overlay()
 
     stats.match_initialized.connect(on_initialized)
     stats.match_ended.connect(on_ended)
     stats.match_destroyed.connect(on_destroyed)
     stats.connection_status.connect(on_status)
-    hotkey.pressed.connect(on_press)
-    hotkey.released.connect(on_release)
+    stats.event_seen.connect(session.on_event)
+    hotkey_h2h.pressed.connect(on_h2h_pressed)
+    hotkey_h2h.released.connect(on_h2h_released)
+    hotkey_session.pressed.connect(on_session_pressed)
+    hotkey_session.released.connect(on_session_released)
 
     stats.start()
-    hotkey.start()
+    hotkey_h2h.start()
+    hotkey_session.start()
 
-    print(f"[ready] hotkeys={cfg['hotkeys']} position={cfg['position']} "
-          f"tcp://{cfg['host']}:{cfg['port']}")
+    print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
+          f"position={cfg['position']} tcp://{cfg['host']}:{cfg['port']}")
+    print(f"        require_rl_focus={cfg.get('require_rl_focus', True)} "
+          f"self={cfg.get('self_player_id') or '(auto-detect on first 1v1)'}")
     print(f"        matches → {MATCHES_PATH.name}")
     print(f"        players → {PLAYERS_PATH.name}")
 
     rc = app.exec()
     stats.stop()
-    hotkey.stop()
+    hotkey_h2h.stop()
+    hotkey_session.stop()
     sys.exit(rc)
 
 
