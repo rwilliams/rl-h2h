@@ -156,6 +156,8 @@ class StatsClient(QObject):
         self._arena: str = ""
         self._match_guid: Optional[str] = None
         self._initialized_emitted = False
+        # Diagnostic: dump first N decoded messages so we can see the real wire format.
+        self._sample_remaining = getattr(self, "_sample_remaining", 5)
 
     def start(self):
         self._thread.start()
@@ -259,6 +261,13 @@ class StatsClient(QObject):
                 pass
 
     def _safe_handle(self, msg) -> None:
+        if self._sample_remaining > 0:
+            self._sample_remaining -= 1
+            try:
+                snippet = json.dumps(msg)[:500]
+            except Exception:
+                snippet = repr(msg)[:500]
+            print(f"[stats] sample: {snippet}", file=sys.stderr)
         if not isinstance(msg, dict):
             return
         try:
@@ -287,20 +296,29 @@ class StatsClient(QObject):
         # Mid-match late joiners are not tracked; the trade is worth ~99% of per-tick work.
         if self._initialized_emitted:
             return
-        arena = (data.get("Game") or {}).get("Arena")
-        if arena:
-            self._arena = arena
+        if not isinstance(data, dict):
+            return
+        game = data.get("Game")
+        if isinstance(game, dict):
+            arena = game.get("Arena")
+            if isinstance(arena, str) and arena:
+                self._arena = arena
+        players = data.get("Players")
+        if not isinstance(players, list):
+            return
         spectator_team_hits: set[int] = set()
-        for p in data.get("Players", []):
+        for p in players:
+            if not isinstance(p, dict):
+                continue
             pid = p.get("PrimaryId")
             team = p.get("TeamNum")
-            if not pid or team not in (0, 1):
+            if not isinstance(pid, str) or team not in (0, 1):
                 continue
             key = player_key(pid)
             self._roster[key] = {
                 "key": key,
                 "primaryId": pid,
-                "name": p.get("Name", "?"),
+                "name": p.get("Name", "?") if isinstance(p.get("Name"), str) else "?",
                 "team": int(team),
             }
             # Spectator-only fields appear iff the local client is on this player's team.
