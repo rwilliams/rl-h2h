@@ -1493,7 +1493,7 @@ def hotkey_hint_html(cfg: dict, expanded: bool) -> str:
         return ""
     return (
         "<table cellpadding='0' cellspacing='0' width='100%'>"
-        "<tr><td height='12'>&nbsp;</td></tr></table>"
+        "<tr><td height='4'>&nbsp;</td></tr></table>"
         "<table width='100%' cellspacing='0' cellpadding='0' "
         "style='border-collapse:collapse;'>"
         "<tr>"
