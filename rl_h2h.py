@@ -1594,11 +1594,18 @@ def main():
             overlay.set_html(render_session_html(session))
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
+                # Qt RichText doesn't reliably honor `height` on `<div>` (block size
+                # follows content), so use a `<table><td height='N'>` which it does honor,
+                # plus a couple of <br>s as belt-and-suspenders.
                 spacer = (
-                    "<div style='height:24px;font-size:1px;line-height:1px;'>&nbsp;</div>"
-                    f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;"
-                    "line-height:1px;'>&nbsp;</div>"
-                    "<div style='height:24px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+                    "<br>"
+                    "<table cellpadding='0' cellspacing='0' width='100%'>"
+                    "<tr><td height='28'>&nbsp;</td></tr></table>"
+                    f"<table cellpadding='0' cellspacing='0' width='100%' bgcolor='{C_FAINT}'>"
+                    "<tr><td height='1'></td></tr></table>"
+                    "<table cellpadding='0' cellspacing='0' width='100%'>"
+                    "<tr><td height='28'>&nbsp;</td></tr></table>"
+                    "<br>"
                 )
                 overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
             else:
