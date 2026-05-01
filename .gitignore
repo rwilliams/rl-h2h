@@ -5,6 +5,7 @@ matches.jsonl
 players.json
 players.json.tmp
 players.corrupt-*.json
+VERSION.tree.json
 
 # Python
 __pycache__/

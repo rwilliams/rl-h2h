@@ -168,6 +168,9 @@ DEFAULT_CONFIG = {
         "                       Expanded mode appends the session stats below the H2H card.",
         "h2h_default_expanded:  initial expanded state at script launch. Re-saved on every",
         "                       toggle so your last choice persists across restarts.",
+        "auto_update:           when true, start.bat checks GitHub for a newer version and",
+        "                       updates silently before launching the app. Off by default;",
+        "                       enable via the tray menu (right-click the H icon).",
         "position: top-left | top-center | top-right | bottom-left | bottom-right",
         "colors: override any overlay color (hex strings). All keys are optional.",
         "  win:   positive accent (wins, +diffs, your YOU tag, recent W pips)",
@@ -184,6 +187,7 @@ DEFAULT_CONFIG = {
     "session_hotkeys": ["f12"],
     "expand_hotkeys": ["f11"],
     "h2h_default_expanded": False,
+    "auto_update": False,
     "require_rl_focus": True,
     "show_match_summary": True,
     "match_summary_seconds": 30,
@@ -1811,6 +1815,17 @@ def main():
             update_overlay()
         wipe_history_action.triggered.connect(_wipe_history)
         menu.addAction(wipe_history_action)
+        menu.addSeparator()
+
+        auto_update_action = QAction("Auto-update on launch")
+        auto_update_action.setCheckable(True)
+        auto_update_action.setChecked(bool(cfg.get("auto_update", False)))
+        def _toggle_auto_update(checked: bool):
+            cfg["auto_update"] = bool(checked)
+            save_config(cfg)
+            print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
+        auto_update_action.toggled.connect(_toggle_auto_update)
+        menu.addAction(auto_update_action)
         menu.addSeparator()
 
         quit_action = QAction("Quit")

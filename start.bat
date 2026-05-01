@@ -3,6 +3,9 @@ REM Launches the head-to-head overlay without a console window.
 REM Place a shortcut to this file in shell:startup to auto-run with Windows.
 cd /d "%~dp0"
 
+REM Self-update: silent, ~1s, never blocks the launch on failure.
+where python >nul 2>&1 && python "%~dp0updater.py" 2>nul
+
 where pythonw >nul 2>&1
 if %errorlevel%==0 (
     start "" pythonw rl_h2h.py

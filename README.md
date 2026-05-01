@@ -34,9 +34,13 @@ A small **Octane icon appears in the Windows system tray** (notification area, b
 
 ## Updates
 
-`start.bat` self-updates on every launch — no `git pull` needed. It checks
-GitHub for a newer version, applies it silently if there is one, then
-launches the app. Adds about a second to startup. Notes:
+Auto-update is **opt-in**. To enable it: right-click the tray icon
+(bottom-right, the H/Octane icon) and tick **Auto-update on launch**. From
+then on, every time you run `start.bat`, the launcher checks GitHub for a
+newer version and applies it silently before starting the app. Untick it
+any time to go back to manual updates (`git pull`).
+
+When auto-update is enabled:
 
 - **Network failures don't block launch.** Offline? The updater times out
   after 5 s and the app starts on whatever's on disk.
@@ -52,8 +56,9 @@ launches the app. Adds about a second to startup. Notes:
 - **Run logs** are written to `update.log` next to the script if you want
   to see what happened.
 
-Prefer to update manually? Launch the app with `python rl_h2h.py` instead
-of `start.bat` — that path skips the updater entirely.
+The setting persists in `config.json` (`auto_update: true|false`).
+Launching with `python rl_h2h.py` instead of `start.bat` always skips the
+updater, regardless of the toggle.
 
 ## Hotkeys (defaults)
 
