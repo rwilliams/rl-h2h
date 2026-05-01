@@ -1260,7 +1260,7 @@ def apply_overrides(cfg: dict) -> None:
         NAME_MAX_LEN = nml
 
 
-def render_session_html(s: SessionStats) -> str:
+def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
     elapsed = int((datetime.now(timezone.utc) - s.started_at).total_seconds())
     h, rem = divmod(elapsed, 3600)
     m = rem // 60
@@ -1337,14 +1337,8 @@ def render_session_html(s: SessionStats) -> str:
         "margin-top:8px;'>&nbsp;</div>"
         "<div style='height:6px;font-size:1px;line-height:1px;'>&nbsp;</div>"
     )
-    show_legend = (
-        s.max_goal_speed > s.max_goal_speed_self
-        or s.max_ball_speed > s.max_ball_speed_self
-        or s.max_impact_force > s.max_impact_force_self
-        or shots_t > shots_s or saves_t > saves_s or demos_t > demos_s
-    )
     legend = ""
-    if show_legend:
+    if with_legend and _session_has_split(s):
         legend = (
             "<table cellpadding='0' cellspacing='0' width='100%'>"
             "<tr><td height='10'>&nbsp;</td></tr></table>"
@@ -1476,32 +1470,73 @@ def _first_keyboard_label(keys: list) -> Optional[str]:
     return keys[0]
 
 
-def hotkey_hint_html(cfg: dict, expanded: bool) -> str:
-    """Footer for the H2H overlay showing the F11/F12 (or whatever's configured)
-    hotkeys: action label on the left, session label on the right. Returns ''
-    when neither hotkey is bound."""
+def _session_has_split(s: SessionStats) -> bool:
+    """True when at least one stat shows the session-vs-self split, so the
+    'Format' legend is informative rather than noise."""
+    return (
+        s.max_goal_speed > s.max_goal_speed_self
+        or s.max_ball_speed > s.max_ball_speed_self
+        or s.max_impact_force > s.max_impact_force_self
+        or s.statfeed_counts.get("Save", 0) > s.statfeed_counts_self.get("Save", 0)
+        or s.statfeed_counts.get("Shot", 0) > s.statfeed_counts_self.get("Shot", 0)
+        or s.statfeed_counts.get("Demolish", 0) > s.statfeed_counts_self.get("Demolish", 0)
+    )
+
+
+def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats]) -> str:
+    """Single-table footer for the H2H overlay. Two rows max:
+
+    - Always: hotkey hint (`F11 expand` left, `F12 session` right).
+    - When `session` is supplied AND has a split: a `Format | session | yours` row.
+
+    Both rows live in the same <table>, so Qt RichText doesn't insert its
+    native ~12-20px between-block margin between them. A `<tr>` is just a row,
+    not a frame, so the spacing is fully under our control via cell padding.
+    """
     expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
     session_label = _first_keyboard_label(cfg.get("session_hotkeys") or [])
-    left = ""
-    right = ""
+
+    rows: list[str] = []
+    cell = (
+        "<td align='{align}' style='color:{C_MUTED};font-size:8pt;"
+        "letter-spacing:0.02em;padding:1px 0;'>{content}</td>"
+    )
+
+    h_left = ""
+    h_right = ""
     if expand_label:
         verb = "collapse" if expanded else "expand"
-        left = f"<b>{expand_label}</b> {verb}"
+        h_left = f"<b>{expand_label}</b> {verb}"
     if session_label:
-        right = f"<b>{session_label}</b> session"
-    if not left and not right:
+        h_right = f"<b>{session_label}</b> session"
+    if h_left or h_right:
+        rows.append(
+            "<tr>"
+            + cell.format(align="left",  C_MUTED=C_MUTED, content=h_left)
+            + cell.format(align="right", C_MUTED=C_MUTED, content=h_right)
+            + "</tr>"
+        )
+
+    if session is not None and _session_has_split(session):
+        rows.append(
+            "<tr>"
+            + cell.format(align="left",  C_MUTED=C_MUTED, content="Format")
+            + cell.format(align="right", C_MUTED=C_MUTED,
+                          content="<b>session</b> | yours")
+            + "</tr>"
+        )
+
+    if not rows:
         return ""
+
     return (
+        # 12px gap between the body content and the footer.
         "<table cellpadding='0' cellspacing='0' width='100%'>"
-        "<tr><td height='4'>&nbsp;</td></tr></table>"
+        "<tr><td height='12'>&nbsp;</td></tr></table>"
         "<table width='100%' cellspacing='0' cellpadding='0' "
         "style='border-collapse:collapse;'>"
-        "<tr>"
-        f"<td align='left'  style='color:{C_MUTED};font-size:8pt;"
-        f"letter-spacing:0.02em;'>{left}</td>"
-        f"<td align='right' style='color:{C_MUTED};font-size:8pt;"
-        f"letter-spacing:0.02em;'>{right}</td>"
-        "</tr></table>"
+        + "".join(rows)
+        + "</table>"
     )
 
 
@@ -1642,18 +1677,25 @@ def main():
             overlay.set_html(render_session_html(session))
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
-                # In expanded mode the session card's own 'Format | session | yours' legend
-                # already sits at the bottom of the overlay — adding the hotkey hint below
-                # it stacks two metadata rows too close together (Qt's native block
-                # spacing fights us). Show the hint only in compact mode, where the
-                # session card isn't rendered.
                 spacer = (
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
                     "<tr><td height='28'>&nbsp;</td></tr></table>"
                 )
-                overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
+                # In expanded mode we render the session WITHOUT its own Format legend
+                # and recombine it (along with the hotkey hint) into a single-table
+                # footer below — that way the two metadata rows are siblings inside
+                # one table and Qt can't slip native block spacing between them.
+                overlay.set_html(
+                    state["h2h_html"]
+                    + spacer
+                    + render_session_html(session, with_legend=False)
+                    + _h2h_footer_html(cfg, expanded=True, session=session)
+                )
             else:
-                overlay.set_html(state["h2h_html"] + hotkey_hint_html(cfg, expanded=False))
+                overlay.set_html(
+                    state["h2h_html"]
+                    + _h2h_footer_html(cfg, expanded=False, session=None)
+                )
         elif state["summary_visible"]:
             overlay.set_html(state["summary_html"])
         else:
