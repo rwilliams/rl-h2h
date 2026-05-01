@@ -341,6 +341,8 @@ class StatsClient(QObject):
         self._arena: str = ""
         self._match_guid: Optional[str] = None
         self._initialized_emitted = False
+        self._last_emitted_roster_size = 0
+        self._round_started = False  # locks the roster after kickoff
         self._spectator_warned = False
         self._score: list[int] = [0, 0]
         self._team_colors: dict[int, str] = {}
@@ -489,7 +491,12 @@ class StatsClient(QObject):
             print(f"[evt] {event}", file=sys.stderr)
             self._maybe_emit_initialized()
         elif event == EVT_ROUND_STARTED:
+            # Lock the roster at kickoff. One last emit if anyone joined since the
+            # previous emit; from this point we stop accumulating players.
             self._maybe_emit_initialized()
+            if self._initialized_emitted and len(self._roster) > self._last_emitted_roster_size:
+                self._emit_match_initialized(reason="round started, final roster")
+            self._round_started = True
         elif event == EVT_MATCH_ENDED:
             print(f"[evt] MatchEnded data={data}", file=sys.stderr)
             self._on_match_ended(data)
@@ -525,8 +532,9 @@ class StatsClient(QObject):
                     if (int(tn) not in self._team_colors and isinstance(cp, str)
                             and len(cp) == 6):
                         self._team_colors[int(tn)] = "#" + cp.upper()
-        # Roster + my_team detection only runs until we've emitted match_initialized.
-        if self._initialized_emitted:
+        # Once the round has actually started (kickoff fired), the roster is locked.
+        # Until then we keep accumulating — players load asynchronously in 2v2/3v3.
+        if self._round_started:
             return
         players = data.get("Players")
         if not isinstance(players, list):
@@ -562,7 +570,12 @@ class StatsClient(QObject):
             self._spectator_warned = True
             print(f"[state] spectator mode? both teams report spectator fields: "
                   f"{spectator_team_hits}", file=sys.stderr)
-        self._maybe_emit_initialized()
+        # First emit when both teams have a player; re-emit on every roster growth so
+        # late joiners (typical in 3v3) appear in the H2H card before kickoff.
+        if not self._initialized_emitted:
+            self._maybe_emit_initialized()
+        elif len(self._roster) > self._last_emitted_roster_size:
+            self._emit_match_initialized(reason="roster grew")
 
     def _on_match_ended(self, data: dict):
         if self._in_replay:
@@ -593,8 +606,14 @@ class StatsClient(QObject):
         if len(teams) < 2:
             return
         self._initialized_emitted = True
+        self._emit_match_initialized(reason="first emit")
+
+    def _emit_match_initialized(self, reason: str = ""):
+        teams = sorted({p["team"] for p in self._roster.values()})
+        self._last_emitted_roster_size = len(self._roster)
+        tag = f" ({reason})" if reason else ""
         print(f"[emit] match_initialized my_team={self._my_team} "
-              f"roster={len(self._roster)} teams={sorted(teams)} arena={self._arena!r}",
+              f"roster={len(self._roster)} teams={teams} arena={self._arena!r}{tag}",
               file=sys.stderr)
         self.match_initialized.emit({
             "teamColors": dict(self._team_colors),
