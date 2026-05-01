@@ -205,7 +205,7 @@ DEFAULT_CONFIG = {
     "font_size": 11,
     "colors": {
         "win":                  "#CCFF00",
-        "loss":                 "#FFDAD6",
+        "loss":                 "#FF6467",
         "dim":                  "#C4C9AC",
         "muted":                "#8E9379",
         "faint":                "#444933",
@@ -828,7 +828,7 @@ C_FAINT    = "#444933"  # outline-variant (dividers, NEW pill border)
 C_BLUE     = "#3B9EFF"  # fallback only — wire ColorPrimary preferred
 C_ORANGE   = "#FF7A29"  # fallback only
 C_WIN      = "#CCFF00"  # lime — wins, streaks, +diffs, recent W pips
-C_LOSS     = "#FFDAD6"  # soft red — losses, recent L pips, negative diffs
+C_LOSS     = "#FF6467"  # red — losses, recent L pips, negative diffs
 
 # Player name truncation in the H2H card (overridable via cfg["name_max_length"]).
 NAME_MAX_LEN = 16
