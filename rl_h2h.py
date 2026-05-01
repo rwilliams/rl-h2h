@@ -164,6 +164,10 @@ DEFAULT_CONFIG = {
         "                       Set manually if you only play 2v2/3v3.",
         "recent_size:           number of recent W/L pips shown in the session card (default 5).",
         "name_max_length:       player name truncation length in the H2H card (default 16).",
+        "expand_hotkeys:        press to toggle the H2H overlay between compact and expanded.",
+        "                       Expanded mode appends the session stats below the H2H card.",
+        "h2h_default_expanded:  initial expanded state at script launch. Re-saved on every",
+        "                       toggle so your last choice persists across restarts.",
         "position: top-left | top-center | top-right | bottom-left | bottom-right",
         "colors: override any overlay color (hex strings). All keys are optional.",
         "  win:   positive accent (wins, +diffs, your YOU tag, recent W pips)",
@@ -178,6 +182,8 @@ DEFAULT_CONFIG = {
     "port": 49123,
     "hotkeys": ["tab", "pad_lb"],
     "session_hotkeys": ["f12"],
+    "expand_hotkeys": ["f11"],
+    "h2h_default_expanded": False,
     "require_rl_focus": True,
     "show_match_summary": True,
     "match_summary_seconds": 30,
@@ -1555,6 +1561,7 @@ def main():
     match_stats = MatchStats()
     hotkey_h2h = HotkeyManager(cfg["hotkeys"])
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
+    hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
 
     state = {
         "in_match": False,
@@ -1563,6 +1570,7 @@ def main():
         "summary_visible": False,
         "summary_html": "",
         "h2h_html": idle_html("Waiting for Rocket League…"),
+        "h2h_expanded": bool(cfg.get("h2h_default_expanded", False)),
     }
 
     def _any_visible() -> bool:
@@ -1581,7 +1589,16 @@ def main():
         if state["session_held"]:
             overlay.set_html(render_session_html(session))
         elif state["h2h_held"] and state["in_match"]:
-            overlay.set_html(state["h2h_html"])
+            if state["h2h_expanded"]:
+                spacer = (
+                    "<div style='height:14px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+                    f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;"
+                    "line-height:1px;'>&nbsp;</div>"
+                    "<div style='height:14px;font-size:1px;line-height:1px;'>&nbsp;</div>"
+                )
+                overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
+            else:
+                overlay.set_html(state["h2h_html"])
         elif state["summary_visible"]:
             overlay.set_html(state["summary_html"])
         else:
@@ -1723,6 +1740,15 @@ def main():
     hotkey_session.pressed.connect(on_session_pressed)
     hotkey_session.released.connect(on_session_released)
 
+    def toggle_expand():
+        state["h2h_expanded"] = not state["h2h_expanded"]
+        cfg["h2h_default_expanded"] = state["h2h_expanded"]
+        save_config(cfg)
+        print(f"[overlay] expanded={state['h2h_expanded']}", file=sys.stderr)
+        update_overlay()
+
+    hotkey_expand.pressed.connect(toggle_expand)
+
     # System tray icon — gives the user a way to quit when launched via start.bat
     # (which uses pythonw and so has no console window to Ctrl+C).
     tray = None
@@ -1807,10 +1833,13 @@ def main():
     stats.start()
     hotkey_h2h.start()
     hotkey_session.start()
+    hotkey_expand.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
+          f"expand={cfg.get('expand_hotkeys') or []} "
           f"position={cfg['position']} tcp://{cfg['host']}:{cfg['port']}")
     print(f"        require_rl_focus={cfg.get('require_rl_focus', True)} "
+          f"expanded={state['h2h_expanded']} "
           f"self={cfg.get('self_player_id') or '(auto-detect on first 1v1)'}")
     print(f"        matches → {MATCHES_PATH.name}")
     print(f"        players → {PLAYERS_PATH.name}")
@@ -1819,6 +1848,7 @@ def main():
     stats.stop()
     hotkey_h2h.stop()
     hotkey_session.stop()
+    hotkey_expand.stop()
     sys.exit(rc)
 
 

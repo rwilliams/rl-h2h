@@ -32,20 +32,45 @@ Or double-click `start.bat` for a windowless launch. The script can be started b
 
 A small **Octane icon appears in the Windows system tray** (notification area, bottom-right). Right-click it for a menu: connection status, "Open data folder", and **Quit**. If you don't see it, expand the chevron `^` next to the clock — Windows hides new tray icons by default. You can pin it: drag the icon onto the taskbar.
 
-To update later: `git pull`.
+## Updates
+
+`start.bat` self-updates on every launch — no `git pull` needed. It checks
+GitHub for a newer version, applies it silently if there is one, then
+launches the app. Adds about a second to startup. Notes:
+
+- **Network failures don't block launch.** Offline? The updater times out
+  after 5 s and the app starts on whatever's on disk.
+- **Local edits are preserved.** If you've modified `rl_h2h.py` (or any
+  other tracked file), the updater detects it and skips that run, leaving
+  your customisations alone. You'll fall behind upstream until you reset.
+- **Your data is never touched.** `config.json`, `matches.jsonl`, and
+  `players.json` are gitignored and ignored by the updater too.
+- **Two modes, picked automatically:**
+  - If you cloned with `git`, the updater runs `git pull --ff-only`.
+  - If you downloaded the repo as a ZIP from GitHub (no git installed),
+    the updater fetches the latest archive directly from GitHub.
+- **Run logs** are written to `update.log` next to the script if you want
+  to see what happened.
+
+Prefer to update manually? Launch the app with `python rl_h2h.py` instead
+of `start.bat` — that path skips the updater entirely.
 
 ## Hotkeys (defaults)
 
 The overlay is **held**, not toggled. Defaults match Rocket League's stock
 scoreboard binding so you can naturally peek at both at the same time.
 
-| Action          | PC      | Xbox    | PlayStation |
-|-----------------|---------|---------|-------------|
-| Head-to-head    | **Tab** | **LB**  | **L1**      |
-| Session stats   | **F12** | —       | —           |
+| Action               | PC      | Xbox    | PlayStation |
+|----------------------|---------|---------|-------------|
+| Head-to-head         | **Tab** | **LB**  | **L1**      |
+| Session stats        | **F12** | —       | —           |
+| Toggle expanded H2H  | **F11** | —       | —           |
 
-Releasing the key hides the overlay. Multiple bindings can be combined; the
-overlay shows while *any* of them is held.
+Hold to show; release to hide. Multiple bindings can be combined; the overlay
+shows while *any* of them is held.
+
+**F11** toggles whether the H2H overlay also shows the session stats card
+underneath. The choice persists across launches (saved to `config.json`).
 
 ## Config
 
