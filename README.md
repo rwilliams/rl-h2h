@@ -36,19 +36,22 @@ To update later: `git pull`.
 
 ## Hotkeys (defaults)
 
-| Bind | Action |
-|---|---|
-| Hold **Tab** | Head-to-head card (only appears during a match) |
-| Hold **View / Share** (`pad_back` on controller) | Same as Tab |
-| Hold **F12** | Session stats overlay |
+The overlay is **held**, not toggled. Defaults match Rocket League's stock
+scoreboard binding so you can naturally peek at both at the same time.
 
-Releasing the key hides the overlay.
+| Action          | PC      | Xbox    | PlayStation |
+|-----------------|---------|---------|-------------|
+| Head-to-head    | **Tab** | **LB**  | **L1**      |
+| Session stats   | **F12** | —       | —           |
+
+Releasing the key hides the overlay. Multiple bindings can be combined; the
+overlay shows while *any* of them is held.
 
 ## Config
 
-Settings live in `config.json` (created on first run). The top of the file has comments listing every supported keyboard and gamepad key name. Common tweaks:
+Settings live in `config.json` (created on first run). The file is **gitignored**, so `git pull` never overwrites your local edits. When new options are added in a future version, your existing values are preserved and only the new keys are merged in. The top of the file has comments listing every supported keyboard and gamepad key name. Common tweaks:
 
-- `hotkeys` / `session_hotkeys` — lists of triggers, e.g. `["tab", "pad_back"]`
+- `hotkeys` / `session_hotkeys` — lists of triggers, e.g. `["tab", "pad_lb"]`. Avoid D-pad bindings — stock RL maps them to quickchat.
 - `position` — `top-right` (default), `top-left`, `top-center`, `bottom-right`, `bottom-left`
 - `require_rl_focus` — set to `false` to also show the overlay on the desktop
 - `self_player_id` — auto-filled after your first 1v1; set manually if you only play 2v2/3v3 (copy your `Platform|Uid` from `players.json`)
