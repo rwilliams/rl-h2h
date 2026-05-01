@@ -134,7 +134,11 @@ def update_players_cache(players: dict, match: dict) -> None:
 
 
 class StatsClient(QObject):
-    """Reads the Rocket League Stats API local WebSocket and emits match-lifecycle signals."""
+    """Reads the Rocket League Stats API local TCP socket and emits match-lifecycle signals.
+
+    Verbose-debug mode: lots of [stats]/[tcp]/[evt]/[state]/[emit] logging on stderr to
+    help diagnose remaining issues. To be cleaned up once stable.
+    """
 
     match_initialized = Signal(dict)
     match_ended = Signal(dict)
@@ -148,6 +152,10 @@ class StatsClient(QObject):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="StatsClient")
+        # Cross-match diagnostics — survive _reset().
+        self._event_counts: dict[str, int] = {}
+        self._first_seen: set[str] = set()
+        self._sample_remaining = 2
         self._reset()
 
     def _reset(self):
@@ -156,7 +164,7 @@ class StatsClient(QObject):
         self._arena: str = ""
         self._match_guid: Optional[str] = None
         self._initialized_emitted = False
-        self._sample_remaining = getattr(self, "_sample_remaining", 2)
+        self._spectator_warned = False
 
     def start(self):
         self._thread.start()
@@ -184,61 +192,43 @@ class StatsClient(QObject):
             self.connection_status.emit(False)
 
     async def _connect_loop(self):
-        # The official doc calls it a "web socket", but in practice RL appears to expose
-        # raw TCP NDJSON. Try WS first; on handshake failure, switch to raw TCP for the
-        # rest of the process lifetime.
+        # The official doc calls it a "web socket" but the wire format is raw TCP NDJSON.
+        # We confirmed this end-to-end; skip the WS probe (it costs a 10s open_timeout
+        # when RL hasn't pushed bytes yet, with no path to fall back).
         backoff = 1.0
-        use_ws = True
         while True:
             try:
-                if use_ws:
-                    try:
-                        print(f"[stats] connecting ws://{self.host}:{self.port}", file=sys.stderr)
-                        await self._run_ws()
-                    except (websockets.exceptions.InvalidHandshake,
-                            websockets.exceptions.InvalidMessage) as e:
-                        print(f"[stats] WS handshake rejected ({type(e).__name__}); "
-                              "switching to raw TCP", file=sys.stderr)
-                        use_ws = False
-                        continue
-                else:
-                    print(f"[stats] connecting tcp://{self.host}:{self.port}", file=sys.stderr)
-                    await self._run_tcp()
+                print(f"[stats] connecting tcp://{self.host}:{self.port}", file=sys.stderr)
+                await self._run_tcp()
                 print("[stats] disconnected; reconnecting", file=sys.stderr)
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
-            except (OSError, websockets.WebSocketException) as e:
+            except OSError as e:
                 self.connection_status.emit(False)
-                print(f"[stats] {type(e).__name__}: {e}", file=sys.stderr)
+                print(f"[stats] connect failed ({type(e).__name__}: {e}); "
+                      f"retry in {backoff:.0f}s", file=sys.stderr)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
-    async def _run_ws(self):
-        async with websockets.connect(
-            f"ws://{self.host}:{self.port}",
-            ping_interval=20, ping_timeout=20, max_size=2 ** 22,
-        ) as ws:
-            self.connection_status.emit(True)
-            print("[stats] connected (websocket)", file=sys.stderr)
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                self._safe_handle(msg)
-
     async def _run_tcp(self):
         reader, writer = await asyncio.open_connection(self.host, self.port)
+        self.connection_status.emit(True)
+        print(f"[tcp] connected to {self.host}:{self.port}", file=sys.stderr)
+        bytes_total = 0
+        msgs_total = 0
+        loop = asyncio.get_running_loop()
+        last_alive = loop.time()
         try:
-            self.connection_status.emit(True)
-            print("[stats] connected (raw tcp)", file=sys.stderr)
             decoder = json.JSONDecoder()
             buf = ""
             while True:
                 chunk = await reader.read(65536)
                 if not chunk:
+                    print(f"[tcp] EOF after {bytes_total} bytes / {msgs_total} msgs",
+                          file=sys.stderr)
                     return
+                bytes_total += len(chunk)
                 buf += chunk.decode("utf-8", errors="replace")
                 while True:
                     stripped = buf.lstrip()
@@ -251,33 +241,53 @@ class StatsClient(QObject):
                         buf = stripped
                         break
                     buf = stripped[idx:]
+                    msgs_total += 1
                     self._safe_handle(obj)
+                now = loop.time()
+                if now - last_alive >= 10.0:
+                    last_alive = now
+                    print(f"[tcp] alive: bytes={bytes_total} msgs={msgs_total} "
+                          f"events={{{self._event_summary()}}}", file=sys.stderr)
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
+            print(f"[tcp] closed after {bytes_total} bytes / {msgs_total} msgs",
+                  file=sys.stderr)
+
+    def _event_summary(self) -> str:
+        if not self._event_counts:
+            return ""
+        return ", ".join(f"{k}={v}" for k, v in sorted(self._event_counts.items()))
 
     def _safe_handle(self, msg) -> None:
-        if self._sample_remaining > 0:
-            self._sample_remaining -= 1
-            try:
-                snippet = json.dumps(msg)[:500]
-            except Exception:
-                snippet = repr(msg)[:500]
-            print(f"[stats] sample: {snippet}", file=sys.stderr)
         if not isinstance(msg, dict):
+            if self._sample_remaining > 0:
+                self._sample_remaining -= 1
+                print(f"[stats] non-dict msg: {repr(msg)[:200]}", file=sys.stderr)
             return
+        event = msg.get("Event", "?")
+        self._event_counts[event] = self._event_counts.get(event, 0) + 1
+        if event not in self._first_seen:
+            self._first_seen.add(event)
+            try:
+                snippet = json.dumps(msg)[:600]
+            except Exception:
+                snippet = repr(msg)[:600]
+            print(f"[stats] first {event}: {snippet}", file=sys.stderr)
         try:
             self._handle(msg)
         except Exception as e:
-            print(f"[stats] handler error on {msg.get('Event', '?')}: {e}", file=sys.stderr)
+            import traceback
+            print(f"[stats] handler error on {event}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     def _handle(self, msg: dict):
         event = msg.get("Event")
-        # Wire format double-encodes: Data arrives as a JSON-encoded string, not a nested
-        # object as the published doc suggests. Decode the inner payload here.
+        # Wire format double-encodes: Data arrives as a JSON-encoded string.
         data = msg.get("Data")
         if isinstance(data, str):
             try:
@@ -289,19 +299,23 @@ class StatsClient(QObject):
         if event == EVT_UPDATE_STATE:
             self._on_update_state(data)
         elif event == EVT_MATCH_CREATED:
+            guid = data.get("MatchGuid") or "(empty)"
+            print(f"[evt] MatchCreated guid={guid!r}", file=sys.stderr)
             self._reset()
             self._match_guid = data.get("MatchGuid")
         elif event in (EVT_MATCH_INITIALIZED, EVT_ROUND_STARTED):
+            print(f"[evt] {event}", file=sys.stderr)
             self._maybe_emit_initialized()
         elif event == EVT_MATCH_ENDED:
+            print(f"[evt] MatchEnded data={data}", file=sys.stderr)
             self._on_match_ended(data)
         elif event == EVT_MATCH_DESTROYED:
+            print("[evt] MatchDestroyed", file=sys.stderr)
             self.match_destroyed.emit()
             self._reset()
 
     def _on_update_state(self, data: dict):
-        # Hot path (up to 120 Hz). Once the roster + side are locked in, skip everything.
-        # Mid-match late joiners are not tracked; the trade is worth ~99% of per-tick work.
+        # Hot path. Once the roster + side are locked in, skip everything.
         if self._initialized_emitted:
             return
         if not isinstance(data, dict):
@@ -309,7 +323,8 @@ class StatsClient(QObject):
         game = data.get("Game")
         if isinstance(game, dict):
             arena = game.get("Arena")
-            if isinstance(arena, str) and arena:
+            if isinstance(arena, str) and arena and arena != self._arena:
+                print(f"[state] arena={arena!r}", file=sys.stderr)
                 self._arena = arena
         players = data.get("Players")
         if not isinstance(players, list):
@@ -323,24 +338,39 @@ class StatsClient(QObject):
             if not isinstance(pid, str) or team not in (0, 1):
                 continue
             key = player_key(pid)
+            is_new = key not in self._roster
+            name_raw = p.get("Name")
+            name = name_raw if isinstance(name_raw, str) else "?"
             self._roster[key] = {
                 "key": key,
                 "primaryId": pid,
-                "name": p.get("Name", "?") if isinstance(p.get("Name"), str) else "?",
+                "name": name,
                 "team": int(team),
             }
-            # Spectator-only fields appear iff the local client is on this player's team.
-            # If both teams report them, the user is spectating — leave my_team unset.
+            if is_new:
+                print(f"[state] +player {name!r} team={team} ({pid})", file=sys.stderr)
             if any(k in p for k in SPECTATOR_FIELDS):
                 spectator_team_hits.add(int(team))
+        # Spectator-only fields appear iff the local client is on this player's team.
+        # If both teams report them, the user is spectating — leave my_team unset.
         if self._my_team is None and len(spectator_team_hits) == 1:
             (self._my_team,) = spectator_team_hits
+            print(f"[state] my_team={self._my_team} "
+                  f"(spectator-hit teams: {spectator_team_hits})", file=sys.stderr)
+        elif self._my_team is None and len(spectator_team_hits) > 1 and not self._spectator_warned:
+            self._spectator_warned = True
+            print(f"[state] spectator mode? both teams report spectator fields: "
+                  f"{spectator_team_hits}", file=sys.stderr)
         self._maybe_emit_initialized()
 
     def _on_match_ended(self, data: dict):
         winner = data.get("WinnerTeamNum")
         if winner is None or self._my_team is None or not self._roster:
+            print(f"[emit] MatchEnded skipped: winner={winner} my_team={self._my_team} "
+                  f"roster={len(self._roster)}", file=sys.stderr)
             return
+        print(f"[emit] match_ended winner={winner} my_team={self._my_team} "
+              f"roster={len(self._roster)}", file=sys.stderr)
         self.match_ended.emit({
             "winner": int(winner),
             "myTeam": self._my_team,
@@ -352,9 +382,13 @@ class StatsClient(QObject):
     def _maybe_emit_initialized(self):
         if self._initialized_emitted or self._my_team is None or not self._roster:
             return
-        if len({p["team"] for p in self._roster.values()}) < 2:
+        teams = {p["team"] for p in self._roster.values()}
+        if len(teams) < 2:
             return
         self._initialized_emitted = True
+        print(f"[emit] match_initialized my_team={self._my_team} "
+              f"roster={len(self._roster)} teams={sorted(teams)} arena={self._arena!r}",
+              file=sys.stderr)
         self.match_initialized.emit({
             "arena": self._arena,
             "myTeam": self._my_team,
