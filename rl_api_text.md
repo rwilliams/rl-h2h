@@ -210,6 +210,41 @@ Ball hit a crossbar.
 }
 ```
 
+##### Detecting own-goals (and the placeholder-event quirk)
+
+The API has **no own-goal flag**, and RL's accounting model doesn't
+treat own-goals as a category at all: every goal is credited to a
+player on the team whose score went up. So when you put the ball in
+your own net, `Scorer.TeamNum` is the *opposing* team's number, and
+`Scorer.Name` is whichever opposing player RL picks (typically the last
+opponent who touched the ball before you deflected it in). The
+score-delta heuristic does **not** work for this reason: by the time
+the score updates, RL has already rebadged the goal as a normal goal
+for the other team.
+
+The only reliable signal is **`BallLastTouch.Player.TeamNum`**:
+
+- Compare it against `Scorer.TeamNum`.
+- If they match → normal goal.
+- If they differ → own-goal. The actual "scorer" (in the colloquial
+  sense — the player who put the ball in their own net) is
+  `BallLastTouch.Player.Name`, **not** `Scorer.Name`.
+
+**Placeholder GoalScored events.** RL emits *two* `GoalScored` events
+around each goal:
+
+1. The real one, with full `Scorer` info.
+2. A placeholder, with `Scorer.Name == ""` and `Scorer.TeamNum == 0`
+   (Python's default int).
+
+For a normal goal, the real event arrives first and the placeholder
+follows after the kickoff. For an own-goal (where RL has to compute
+credit during the replay), the placeholder arrives first and the real
+event follows once credit is assigned. Either way, **drop placeholders
+where `Scorer.Name` is empty** — they're not actionable.
+
+This is what `rl_h2h.py` does in `StatsClient._classify_goal_scored`.
+
 #### `StatfeedEvent`
 Fires whenever a player earns a stat (demos, saves, etc).
 

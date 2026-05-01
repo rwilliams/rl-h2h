@@ -374,6 +374,22 @@ def update_players_cache(players: dict, match: dict) -> None:
         bucket["lastScore"] = my_pov
 
 
+def _last_touch_player(data: dict) -> tuple[Optional[str], Optional[int]]:
+    """(Name, TeamNum) of BallLastTouch.Player, or (None, None) if absent/malformed."""
+    last_touch = data.get("BallLastTouch")
+    if not isinstance(last_touch, dict):
+        return (None, None)
+    player = last_touch.get("Player")
+    if not isinstance(player, dict):
+        return (None, None)
+    name = player.get("Name")
+    team = player.get("TeamNum")
+    return (
+        name if isinstance(name, str) else None,
+        team if isinstance(team, int) and team in (0, 1) else None,
+    )
+
+
 class StatsClient(QObject):
     """Reads the Rocket League Stats API local TCP socket and emits match-lifecycle signals."""
 
@@ -501,7 +517,10 @@ class StatsClient(QObject):
                 data = {}
         if not isinstance(data, dict):
             data = {}
-        if event:
+        if event == EVT_GOAL_SCORED:
+            if self._classify_goal_scored(data):
+                self.event_seen.emit(event, data)
+        elif event:
             self.event_seen.emit(event, data)
         if event == EVT_UPDATE_STATE:
             self._on_update_state(data)
@@ -606,6 +625,27 @@ class StatsClient(QObject):
             "score": list(self._score),
             "teamColors": dict(self._team_colors),
         })
+
+    def _classify_goal_scored(self, data: dict) -> bool:
+        """Set `bOwnGoal` on data; return False for placeholder events.
+
+        See `rl_api_text.md` for the placeholder-event quirk and own-goal
+        derivation rules.
+        """
+        scorer = data.get("Scorer")
+        if not isinstance(scorer, dict):
+            return False
+        scorer_name = scorer.get("Name")
+        if not scorer_name:
+            return False
+        scorer_team = scorer.get("TeamNum")
+        _, last_team = _last_touch_player(data)
+        data["bOwnGoal"] = (
+            scorer_team in (0, 1)
+            and last_team in (0, 1)
+            and scorer_team != last_team
+        )
+        return True
 
     def _maybe_emit_initialized(self):
         if (self._initialized_emitted or self._in_replay
@@ -1097,6 +1137,8 @@ class SessionStats:
         self.max_impact_force_self = 0.0
         self.fastest_goal_time: Optional[float] = None
         self.fastest_goal_time_self: Optional[float] = None
+        self.own_goals = 0
+        self.own_goals_self = 0
         self.statfeed_counts: dict[str, int] = {}
         self.statfeed_counts_self: dict[str, int] = {}
 
@@ -1107,6 +1149,11 @@ class SessionStats:
         if event == EVT_GOAL_SCORED:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
+            if data.get("bOwnGoal"):
+                self.own_goals += 1
+                last_name, _ = _last_touch_player(data)
+                if self._is_self(last_name):
+                    self.own_goals_self += 1
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 if sp > self.max_goal_speed:
@@ -1335,6 +1382,7 @@ def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
         _stat_row("Max ball speed",   _pair_max(s.max_ball_speed, s.max_ball_speed_self)),
         _stat_row("Hardest crossbar", _pair_max(s.max_impact_force, s.max_impact_force_self)),
         _stat_row("Fastest goal",     _pair_fastest(s.fastest_goal_time, s.fastest_goal_time_self)),
+        _stat_row("Own goals",        _pair_count(s.own_goals, s.own_goals_self)),
     ]
 
     header = (
@@ -1406,6 +1454,8 @@ class MatchStats:
         # Min (fastest goal time in seconds; None = no goal yet)
         self.fastest_goal_time: Optional[float] = None
         self.fastest_goal_time_self: Optional[float] = None
+        self.own_goals = 0
+        self.own_goals_self = 0
 
     def _is_self(self, name) -> bool:
         return bool(name) and name == self.self_name
@@ -1414,6 +1464,11 @@ class MatchStats:
         if event == EVT_GOAL_SCORED:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
+            if data.get("bOwnGoal"):
+                self.own_goals += 1
+                last_name, _ = _last_touch_player(data)
+                if self._is_self(last_name):
+                    self.own_goals_self += 1
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 self.max_goal_speed = max(self.max_goal_speed, float(sp))
@@ -1492,6 +1547,7 @@ def _session_has_split(s: SessionStats) -> bool:
         s.max_goal_speed > s.max_goal_speed_self
         or s.max_ball_speed > s.max_ball_speed_self
         or s.max_impact_force > s.max_impact_force_self
+        or s.own_goals > s.own_goals_self
         or s.statfeed_counts.get(SF_SAVE, 0) > s.statfeed_counts_self.get(SF_SAVE, 0)
         or s.statfeed_counts.get(SF_SHOT, 0) > s.statfeed_counts_self.get(SF_SHOT, 0)
         or s.statfeed_counts.get(SF_DEMOLISH, 0) > s.statfeed_counts_self.get(SF_DEMOLISH, 0)
@@ -1629,6 +1685,9 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
     if ms.fastest_goal_time is not None:
         fun_rows.append(_stat_row("Fastest goal",
                                   _pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self, always_pair=True)))
+    if ms.own_goals > 0:
+        fun_rows.append(_stat_row("Own goals",
+                                  _pair_count(ms.own_goals, ms.own_goals_self, always_pair=True)))
 
     body = ""
     if play_rows:
