@@ -885,11 +885,15 @@ def humanize_when(iso_ts: Optional[str]) -> str:
     return f"{secs // 86400}d ago"
 
 
-def _recent_pips(recent: list) -> str:
-    if not isinstance(recent, list) or not recent:
+def _recent_pips(recent) -> str:
+    """Render a sequence of W/L letters as colored pips. Accepts any iterable
+    (list, deque, tuple) — session.recent is a deque, so we materialise to a
+    list first instead of slicing."""
+    if not recent:
         return ""
+    items = list(recent)[-5:]
     parts = []
-    for r in recent[-5:]:
+    for r in items:
         color = C_WIN if r == "W" else C_LOSS
         parts.append(f"<span style='color:{color};'>{r}</span>")
     return (
