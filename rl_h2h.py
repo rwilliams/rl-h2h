@@ -12,8 +12,10 @@ import contextlib
 import ctypes
 import json
 import os
+import queue
 import sys
 import threading
+import time
 from collections import deque
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -30,6 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 MATCHES_PATH = APP_DIR / "matches.jsonl"
 PLAYERS_PATH = APP_DIR / "players.json"
+MMR_CACHE_PATH = APP_DIR / "mmr_cache.json"
 
 
 EVT_MATCH_CREATED = "MatchCreated"
@@ -175,8 +178,17 @@ DEFAULT_CONFIG = {
         "name_max_length:       player name truncation length in the H2H card (default 16).",
         "expand_hotkeys:        press to toggle the H2H overlay between compact and expanded.",
         "                       Expanded mode appends the session stats below the H2H card.",
+        "cycle_hotkeys:         press to cycle the MMR category shown in the H2H overlay.",
+        "                       Order: best -> 1v1 -> 2v2 -> 3v3 -> best. Persists.",
         "h2h_default_expanded:  initial expanded state at script launch. Re-saved on every",
         "                       toggle so your last choice persists across restarts.",
+        "mmr_enabled:           when true, fetches each opponent's rank/MMR from",
+        "                       rocketleague.tracker.network (one HTTP request per new",
+        "                       opponent, cached for 10 minutes). Off by default — flipping it",
+        "                       on sends opponents' Platform|Uid (Epic) or display names",
+        "                       (other platforms) to tracker.network. Toggle via the tray menu.",
+        "mmr_category:          which playlist's MMR to show: 'best' | '1v1' | '2v2' | '3v3'.",
+        "                       Cycle live with the cycle_hotkeys key.",
         "auto_update:           when true, start.bat checks GitHub for a newer version and",
         "                       updates silently before launching the app. Off by default;",
         "                       enable via the tray menu (right-click the H icon).",
@@ -195,7 +207,10 @@ DEFAULT_CONFIG = {
     "hotkeys": ["tab", "pad_lb"],
     "session_hotkeys": ["f12"],
     "expand_hotkeys": ["f11"],
+    "cycle_hotkeys": ["f10"],
     "h2h_default_expanded": False,
+    "mmr_enabled": False,
+    "mmr_category": "best",
     "auto_update": False,
     "require_rl_focus": True,
     "show_match_summary": True,
@@ -388,6 +403,308 @@ def _last_touch_player(data: dict) -> tuple[Optional[str], Optional[int]]:
         name if isinstance(name, str) else None,
         team if isinstance(team, int) and team in (0, 1) else None,
     )
+
+
+# ---- MMR / TRN integration ---------------------------------------------------
+# The official Stats API doesn't expose MMR or rank. We optionally pull it from
+# tracker.network's public JSON endpoint, which serves real-time data behind a
+# 4-minute server-side cache. curl_cffi impersonates Chrome's TLS fingerprint
+# so Cloudflare lets us through without a browser.
+#
+# Lookup quirk: TRN's profile endpoint indexes by display name across every
+# platform we care about. Numeric platform IDs (raw 32-hex Epic, PSN/XBL ints)
+# return 400/404. Cache key stays the stable Platform|Uid (so renames don't
+# pollute our cache); the lookup string is the live wire's Name field.
+
+MMR_PLATFORM_TO_TRN = {
+    "Epic": "epic",
+    "Steam": "steam",
+    "PS4": "psn",
+    "XboxOne": "xbl",
+    "Switch": "switch",
+}
+
+# TRN playlist IDs we care about. Casual / extra-modes are intentionally
+# excluded from "best" — they don't reflect competitive skill.
+MMR_PLAYLIST_IDS = {
+    10: "1v1",
+    11: "2v2",
+    13: "3v3",
+}
+MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3")
+
+# Standard RL rank colors. Tier strings come from TRN as "Bronze I", "Diamond III",
+# "Grand Champion II", etc. — we match on the prefix word.
+MMR_TIER_COLORS = {
+    "Unranked":         "#8E9379",
+    "Bronze":           "#B87333",
+    "Silver":           "#C0C5CD",
+    "Gold":             "#F0C674",
+    "Platinum":         "#6FC8D6",
+    "Diamond":          "#7FA9F2",
+    "Champion":         "#B59CEE",
+    "Grand Champion":   "#EC4F50",
+    "Supersonic Legend": "#DB2C70",
+}
+
+MMR_TTL_SECONDS = 600   # local cache freshness — TRN's own TTL is 4 min
+MMR_FETCH_INTERVAL = 2.0   # min seconds between outbound TRN requests
+
+
+def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
+    """(trn_platform_slug, display_name) for a wire identity, or None if
+    unsupported. TRN's lookup endpoint requires display name on every platform
+    we care about — numeric platform IDs return 400/404."""
+    if not name:
+        return None
+    parts = primary_id.split("|")
+    if not parts:
+        return None
+    plat = MMR_PLATFORM_TO_TRN.get(parts[0])
+    if not plat:
+        return None
+    return (plat, name)
+
+
+def _tier_color(tier: Optional[str]) -> str:
+    if not tier:
+        return MMR_TIER_COLORS["Unranked"]
+    for prefix, color in MMR_TIER_COLORS.items():
+        if tier.startswith(prefix):
+            return color
+    return C_TEXT if "C_TEXT" in globals() else "#E0E3E5"
+
+
+def _parse_trn_payload(data: dict) -> dict:
+    """Distill a TRN profile response into our compact cache shape.
+
+    Output:
+      {
+        "fetched_at":  "2026-05-01T22:21:00+00:00",
+        "lastUpdated": "2026-05-01T22:20:22+00:00",  # from TRN
+        "handle":      "PantuflaRl",
+        "playlists":   {"1v1": {"mmr": 400, "tier": "Silver III", "division": "Division II"}, ...},
+        "best":        {"mmr": 473, "tier": "Gold I", "division": "Division I", "playlist": "2v2"},
+      }
+    """
+    info = (data or {}).get("platformInfo") or {}
+    meta = (data or {}).get("metadata") or {}
+    last_updated = (meta.get("lastUpdated") or {}).get("value")
+
+    playlists: dict[str, dict] = {}
+    for seg in (data or {}).get("segments") or []:
+        if seg.get("type") != "playlist":
+            continue
+        attrs = seg.get("attributes") or {}
+        pid = attrs.get("playlistId")
+        label = MMR_PLAYLIST_IDS.get(pid)
+        if not label:
+            continue
+        stats = seg.get("stats") or {}
+        rating = (stats.get("rating") or {}).get("value")
+        tier = ((stats.get("tier") or {}).get("metadata") or {}).get("name")
+        div = ((stats.get("division") or {}).get("metadata") or {}).get("name")
+        if rating is None:
+            continue
+        playlists[label] = {
+            "mmr": int(rating),
+            "tier": tier or "Unranked",
+            "division": div or "",
+        }
+
+    best = None
+    for label, p in playlists.items():
+        if best is None or p["mmr"] > best["mmr"]:
+            best = {**p, "playlist": label}
+
+    return {
+        "fetched_at": now_iso(),
+        "lastUpdated": last_updated,
+        "handle": info.get("platformUserHandle"),
+        "playlists": playlists,
+        "best": best,
+    }
+
+
+def load_mmr_cache() -> dict:
+    if not MMR_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(MMR_CACHE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[mmr] failed to read cache, starting fresh: {e}", file=sys.stderr)
+        return {}
+
+
+def save_mmr_cache(cache: dict) -> None:
+    try:
+        atomic_write_text(MMR_CACHE_PATH, json.dumps(cache, indent=2, sort_keys=True))
+    except OSError as e:
+        print(f"[mmr] failed to write cache: {e}", file=sys.stderr)
+
+
+class MMRClient(QObject):
+    """Background fetcher for player MMR/rank data from tracker.network.
+
+    Fully off-thread: a single worker thread drains a queue, hits the TRN
+    public API, and emits `updated(player_key)` when fresh data lands. The Qt
+    main loop only ever touches the cache via `get(key)`. Soft-fails on every
+    error path — the overlay never breaks because TRN is down.
+
+    Disabled (`enabled=False`) means: never enqueue, never network. Toggleable
+    at runtime via `set_enabled()` so the tray menu can flip it without a
+    restart.
+    """
+
+    updated = Signal(str)  # cache key (Platform|Uid)
+
+    _BASE_URL = "https://api.tracker.gg/api/v2/rocket-league/standard/profile/{plat}/{ident}"
+    _HEADERS = {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://rocketleague.tracker.network",
+        "Referer": "https://rocketleague.tracker.network/",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def __init__(self, enabled: bool = False, ttl_seconds: int = MMR_TTL_SECONDS):
+        super().__init__()
+        self._enabled = bool(enabled)
+        self._ttl = max(60, int(ttl_seconds))
+        self._cache: dict = load_mmr_cache()
+        self._cache_lock = threading.Lock()
+        self._queue: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
+        self._inflight: set[str] = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="MMRFetcher",
+        )
+        # Defer curl_cffi import: the module is optional. If it's missing, we
+        # disable network access but still serve cached data.
+        try:
+            from curl_cffi import requests as _curl_requests  # noqa
+            self._requests = _curl_requests
+        except ImportError:
+            self._requests = None
+            if self._enabled:
+                print("[mmr] curl_cffi not installed; MMR fetch disabled. "
+                      "Run: pip install curl_cffi", file=sys.stderr)
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def set_enabled(self, on: bool) -> None:
+        self._enabled = bool(on)
+
+    def is_enabled(self) -> bool:
+        return self._enabled and self._requests is not None
+
+    def get(self, key: str) -> Optional[dict]:
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            return dict(entry) if entry else None
+
+    def _is_stale(self, entry: Optional[dict]) -> bool:
+        if not entry:
+            return True
+        ts = entry.get("fetched_at")
+        if not isinstance(ts, str):
+            return True
+        try:
+            t = datetime.fromisoformat(ts)
+        except ValueError:
+            return True
+        age = (datetime.now(timezone.utc) - t).total_seconds()
+        return age >= self._ttl
+
+    def enqueue(self, primary_id: str, name: str) -> None:
+        """Queue a refresh for this opponent. Skips if disabled, already
+        in-flight, or cache is fresh enough."""
+        if not self.is_enabled():
+            return
+        key = player_key(primary_id)
+        if key in self._inflight:
+            return
+        with self._cache_lock:
+            entry = self._cache.get(key)
+        if not self._is_stale(entry):
+            return
+        handle = mmr_lookup_handle(primary_id, name)
+        if handle is None:
+            return
+        plat, ident = handle
+        self._inflight.add(key)
+        self._queue.put((key, plat, ident))
+
+    def enqueue_roster(self, roster: list[dict]) -> None:
+        """Convenience: queue every player in a match roster."""
+        for p in roster:
+            pid = p.get("primaryId") or p.get("key")
+            if not pid:
+                continue
+            self.enqueue(pid, p.get("name") or "")
+
+    def _worker(self) -> None:
+        last_request = 0.0
+        while not self._stop.is_set():
+            try:
+                key, plat, ident = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # Throttle global outbound rate.
+            since = time.monotonic() - last_request
+            if since < MMR_FETCH_INTERVAL:
+                self._stop.wait(MMR_FETCH_INTERVAL - since)
+                if self._stop.is_set():
+                    break
+            try:
+                self._fetch_one(key, plat, ident)
+            except Exception as e:
+                print(f"[mmr] {key} fetch failed: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+            finally:
+                self._inflight.discard(key)
+            last_request = time.monotonic()
+
+    def _fetch_one(self, key: str, plat: str, ident: str) -> None:
+        if self._requests is None:
+            return
+        url = self._BASE_URL.format(plat=plat, ident=ident)
+        r = self._requests.get(url, headers=self._HEADERS,
+                               impersonate="chrome120", timeout=15)
+        if r.status_code == 404:
+            # Player isn't on TRN under this handle. Cache a negative entry so
+            # we don't keep hammering the same dead lookup every time the
+            # overlay opens.
+            with self._cache_lock:
+                self._cache[key] = {
+                    "fetched_at": now_iso(),
+                    "not_found": True,
+                    "handle": ident,
+                }
+                save_mmr_cache(self._cache)
+            self.updated.emit(key)
+            return
+        if r.status_code != 200:
+            print(f"[mmr] {key} HTTP {r.status_code}: {r.text[:120]}",
+                  file=sys.stderr)
+            return
+        try:
+            payload = r.json()
+        except ValueError as e:
+            print(f"[mmr] {key} bad JSON: {e}", file=sys.stderr)
+            return
+        data = (payload or {}).get("data")
+        if not isinstance(data, dict):
+            return
+        entry = _parse_trn_payload(data)
+        with self._cache_lock:
+            self._cache[key] = entry
+            save_mmr_cache(self._cache)
+        self.updated.emit(key)
 
 
 class StatsClient(QObject):
@@ -944,7 +1261,75 @@ def _recent_pips(recent) -> str:
     )
 
 
-def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
+def _mmr_pick(entry: Optional[dict], category: str) -> Optional[dict]:
+    """Pull the right playlist's MMR record out of a cache entry, given the
+    user's selected category. Returns None when nothing useful is available
+    (entry missing, only contains a not_found marker, or the requested
+    playlist hasn't been seen yet)."""
+    if not entry or entry.get("not_found"):
+        return None
+    if category == "best":
+        b = entry.get("best")
+        return b if b and b.get("mmr") is not None else None
+    pl = (entry.get("playlists") or {}).get(category)
+    if not pl or pl.get("mmr") is None:
+        return None
+    return {**pl, "playlist": category}
+
+
+def _render_mmr_chip(entry: Optional[dict], category: str, mmr_enabled: bool) -> str:
+    """Tier + MMR for the player's selected category, colored by rank.
+
+    States:
+      - MMR disabled                          -> empty string
+      - enabled, no entry yet (loading)       -> dim "…"
+      - enabled, cache says not_found         -> dim "—"
+      - enabled, picked playlist not played   -> dim "—"
+      - enabled, has data                     -> "Gold II · 531"  (+ "2v2" hint in best mode)
+    """
+    if not mmr_enabled:
+        return ""
+    if entry is None:
+        return (
+            f"<span style='color:{C_MUTED};font-size:8pt;letter-spacing:0.04em;'>"
+            "…</span>"
+        )
+    if entry.get("not_found"):
+        return (
+            f"<span style='color:{C_MUTED};font-size:8pt;letter-spacing:0.04em;'>"
+            "—</span>"
+        )
+    pick = _mmr_pick(entry, category)
+    if not pick:
+        return (
+            f"<span style='color:{C_MUTED};font-size:8pt;letter-spacing:0.04em;'>"
+            "—</span>"
+        )
+    tier = pick.get("tier") or "Unranked"
+    mmr = pick.get("mmr")
+    color = _tier_color(tier)
+    parts = [
+        f"<span style='color:{color};font-size:8pt;font-weight:700;"
+        f"letter-spacing:0.02em;'>{tier}</span>",
+        f"<span style='color:{C_DIM};font-family:Consolas,\"SF Mono\",monospace;"
+        f"font-size:8pt;font-weight:600;'>{mmr}</span>",
+    ]
+    if category == "best":
+        playlist = pick.get("playlist")
+        if playlist:
+            parts.append(
+                f"<span style='color:{C_MUTED};font-size:7pt;font-weight:600;"
+                f"letter-spacing:0.06em;text-transform:uppercase;'>{playlist}</span>"
+            )
+    sep = (
+        f"<span style='color:{C_FAINT};font-size:8pt;'>&nbsp;·&nbsp;</span>"
+    )
+    return sep.join(parts)
+
+
+def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] = None,
+                mmr_db: Optional[dict] = None, mmr_category: str = "best",
+                mmr_enabled: bool = False) -> str:
     rec = players_db.get(p["key"])
     bucket = BUCKET_WITH if p["team"] == my_team else BUCKET_VS
     name = p["name"]
@@ -1006,8 +1391,24 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
         else:
             sub = ""
 
+    # MMR chip lives in the sub-row, before any history hint. We separate the
+    # two with a faint dot — Qt RichText collapses adjacent inline spans cleanly.
+    mmr_chip = ""
+    if mmr_enabled:
+        mmr_entry = (mmr_db or {}).get(p["key"])
+        mmr_chip = _render_mmr_chip(mmr_entry, mmr_category, mmr_enabled)
+    if mmr_chip and sub:
+        combined_sub = (
+            mmr_chip
+            + f"<span style='color:{C_FAINT};font-size:8pt;'>&nbsp;·&nbsp;</span>"
+            + sub
+        )
+    else:
+        combined_sub = mmr_chip or sub
+
     sub_row = (
-        f"<tr><td colspan='2' style='padding:0 0 2px 0;'>{sub}</td></tr>" if sub else ""
+        f"<tr><td colspan='2' style='padding:0 0 2px 0;'>{combined_sub}</td></tr>"
+        if combined_sub else ""
     )
     return (
         "<table width='100%' cellspacing='0' cellpadding='0' "
@@ -1024,7 +1425,9 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
 
 
 def _team_section(label: str, color: str, players: list, is_you: bool,
-                  my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
+                  my_team: int, players_db: dict, self_id: Optional[str] = None,
+                  mmr_db: Optional[dict] = None, mmr_category: str = "best",
+                  mmr_enabled: bool = False) -> str:
     # Both teams get their actual ColorPrimary from the wire. The YOU tag lives on
     # the player row (in _player_row), not duplicated on the section header.
     bar_color = color
@@ -1043,7 +1446,12 @@ def _team_section(label: str, color: str, players: list, is_you: bool,
     )
 
     if players:
-        body = "".join(_player_row(p, my_team, players_db, self_id) for p in players)
+        body = "".join(
+            _player_row(p, my_team, players_db, self_id,
+                        mmr_db=mmr_db, mmr_category=mmr_category,
+                        mmr_enabled=mmr_enabled)
+            for p in players
+        )
         body_block = (
             "<table width='100%' cellspacing='0' cellpadding='0' "
             "style='border-collapse:collapse;'>"
@@ -1064,7 +1472,9 @@ def _team_section(label: str, color: str, players: list, is_you: bool,
 
 def render_html(roster: list[dict], my_team: int, arena: str,
                 players_db: dict, team_colors: dict,
-                self_id: Optional[str] = None) -> str:
+                self_id: Optional[str] = None,
+                mmr_db: Optional[dict] = None, mmr_category: str = "best",
+                mmr_enabled: bool = False) -> str:
     blue = sorted([p for p in roster if p["team"] == 0], key=lambda x: x["name"].lower())
     orange = sorted([p for p in roster if p["team"] == 1], key=lambda x: x["name"].lower())
 
@@ -1076,14 +1486,35 @@ def render_html(roster: list[dict], my_team: int, arena: str,
         orange_color = C_ORANGE
 
     arena_label = pretty_arena(arena)
-    if arena_label:
+    # When MMR is enabled, the right cell shows the active category pill
+    # ("MMR · BEST", "MMR · 2V2") so the user always sees what F10 is set to.
+    # We show arena on a second header row so neither piece of info is lost.
+    if mmr_enabled:
+        cat = (mmr_category or "best").upper()
+        right_cell = (
+            f"<td align='right' style='color:{C_DIM};font-size:8pt;font-weight:700;"
+            f"letter-spacing:0.18em;white-space:nowrap;'>"
+            f"<span style='color:{C_MUTED};font-weight:500;'>MMR&nbsp;·&nbsp;</span>"
+            f"{cat}"
+            "</td>"
+        )
+    elif arena_label:
         a = arena_label if len(arena_label) <= 22 else arena_label[:21] + "…"
-        arena_cell = (
+        right_cell = (
             f"<td align='right' style='color:{C_MUTED};font-size:8pt;font-weight:500;"
             f"letter-spacing:0.10em;'>{a.upper()}</td>"
         )
     else:
-        arena_cell = "<td></td>"
+        right_cell = "<td></td>"
+
+    arena_subline = ""
+    if mmr_enabled and arena_label:
+        a = arena_label if len(arena_label) <= 22 else arena_label[:21] + "…"
+        arena_subline = (
+            f"<div style='color:{C_MUTED};font-size:8pt;font-weight:500;"
+            f"letter-spacing:0.10em;text-align:right;padding-top:1px;'>"
+            f"{a.upper()}</div>"
+        )
 
     header = (
         "<table width='100%' cellspacing='0' cellpadding='0' "
@@ -1091,9 +1522,10 @@ def render_html(roster: list[dict], my_team: int, arena: str,
         "<tr>"
         f"<td align='left' style='color:{C_TEXT};font-size:10pt;font-weight:700;"
         "letter-spacing:0.18em;'>HEAD&middot;TO&middot;HEAD</td>"
-        f"{arena_cell}"
+        f"{right_cell}"
         "</tr>"
         "</table>"
+        f"{arena_subline}"
         f"<div style='height:1px;background-color:{C_FAINT};font-size:1px;line-height:1px;"
         "margin-top:8px;'>&nbsp;</div>"
         "<div style='height:10px;font-size:1px;line-height:1px;'>&nbsp;</div>"
@@ -1101,9 +1533,11 @@ def render_html(roster: list[dict], my_team: int, arena: str,
     spacer = "<div style='height:10px;font-size:1px;line-height:1px;'>&nbsp;</div>"
     return (
         header
-        + _team_section("BLUE",   blue_color,   blue,   my_team == 0, my_team, players_db, self_id)
+        + _team_section("BLUE",   blue_color,   blue,   my_team == 0, my_team, players_db, self_id,
+                        mmr_db=mmr_db, mmr_category=mmr_category, mmr_enabled=mmr_enabled)
         + spacer
-        + _team_section("ORANGE", orange_color, orange, my_team == 1, my_team, players_db, self_id)
+        + _team_section("ORANGE", orange_color, orange, my_team == 1, my_team, players_db, self_id,
+                        mmr_db=mmr_db, mmr_category=mmr_category, mmr_enabled=mmr_enabled)
     )
 
 
@@ -1555,17 +1989,21 @@ def _session_has_split(s: SessionStats) -> bool:
 
 
 def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats]) -> str:
-    """Single-table footer for the H2H overlay. Two rows max:
+    """Single-table footer for the H2H overlay.
 
-    - Always: hotkey hint (`F11 expand` left, `F12 session` right).
+    - Always: hotkey hint row (`F11 expand` left, `F12 session` right).
+    - When MMR is enabled: a second hotkey row with `F10 cycle MMR` and the
+      current category (e.g. "best", "2v2") so the user sees what's selected.
     - When `session` is supplied AND has a split: a `Format | session | yours` row.
 
-    Both rows live in the same <table>, so Qt RichText doesn't insert its
-    native ~12-20px between-block margin between them. A `<tr>` is just a row,
-    not a frame, so the spacing is fully under our control via cell padding.
+    Rows live in the same <table>, so Qt RichText doesn't insert its native
+    ~12-20px between-block margin between them.
     """
     expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
     session_label = _first_keyboard_label(cfg.get("session_hotkeys") or [])
+    cycle_label = _first_keyboard_label(cfg.get("cycle_hotkeys") or [])
+    mmr_enabled = bool(cfg.get("mmr_enabled", False))
+    mmr_category = cfg.get("mmr_category", "best")
 
     rows: list[str] = []
     cell = (
@@ -1580,6 +2018,16 @@ def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats])
             + cell.format(align="left",  C_MUTED=C_MUTED, content="Format")
             + cell.format(align="right", C_MUTED=C_MUTED,
                           content="<b>session</b> | yours")
+            + "</tr>"
+        )
+
+    if mmr_enabled and cycle_label:
+        rows.append(
+            "<tr>"
+            + cell.format(align="left",  C_MUTED=C_MUTED,
+                          content=f"<b>{cycle_label}</b> cycle MMR")
+            + cell.format(align="right", C_MUTED=C_MUTED,
+                          content=f"<b>{mmr_category}</b>")
             + "</tr>"
         )
 
@@ -1721,9 +2169,17 @@ def main():
     stats = StatsClient(cfg["host"], cfg["port"])
     session = SessionStats(recent_size=cfg.get("recent_size", 5))
     match_stats = MatchStats()
+    mmr_client = MMRClient(enabled=bool(cfg.get("mmr_enabled", False)))
+    mmr_client.start()
     hotkey_h2h = HotkeyManager(cfg["hotkeys"])
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
     hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
+    hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
+
+    # Sanitize the persisted category once at startup — guards against a hand-edited
+    # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
+    if cfg.get("mmr_category") not in MMR_CATEGORIES:
+        cfg["mmr_category"] = "best"
 
     state = {
         "in_match": False,
@@ -1733,6 +2189,10 @@ def main():
         "summary_html": "",
         "h2h_html": idle_html("Waiting for Rocket League…"),
         "h2h_expanded": bool(cfg.get("h2h_default_expanded", False)),
+        "roster": [],
+        "my_team": 0,
+        "arena": "",
+        "team_colors": {},
     }
 
     def _any_visible() -> bool:
@@ -1817,6 +2277,23 @@ def main():
 
     summary_timer.timeout.connect(hide_summary)
 
+    def rerender_h2h() -> None:
+        """Re-run render_html against the saved roster — used both when a match
+        starts and whenever fresh MMR data lands or the user cycles category."""
+        if not state["roster"]:
+            return
+        self_id = cfg.get("self_player_id")
+        # Snapshot the cache once per render so all rows see a consistent view
+        # even if the worker writes mid-build.
+        mmr_db = {p["key"]: mmr_client.get(p["key"]) for p in state["roster"]}
+        state["h2h_html"] = render_html(
+            state["roster"], state["my_team"], state["arena"],
+            players_db, state["team_colors"], self_id,
+            mmr_db=mmr_db,
+            mmr_category=cfg.get("mmr_category", "best"),
+            mmr_enabled=mmr_client.is_enabled(),
+        )
+
     def on_initialized(payload: dict):
         state["in_match"] = True
         hide_summary()  # next match starting → drop any in-flight post-match popup
@@ -1838,12 +2315,19 @@ def main():
                     break
         # Reset per-match aggregator using the now-known self_name.
         match_stats.reset(self_name=session.self_name)
-        html = render_html(
-            payload["players"], payload["myTeam"], payload["arena"],
-            players_db, payload.get("teamColors") or {},
-            self_id,
-        )
-        state["h2h_html"] = html
+        # Persist roster bits we need to re-render asynchronously when MMR
+        # data trickles in (or when the user toggles category via F10).
+        state["roster"] = payload["players"]
+        state["my_team"] = payload["myTeam"]
+        state["arena"] = payload["arena"]
+        state["team_colors"] = payload.get("teamColors") or {}
+        # Skip self when querying TRN — no point hammering the API for our own
+        # MMR every match. Other rows enqueue immediately; cached entries serve
+        # instantly, fresh entries arrive over the next ~1s per opponent.
+        if mmr_client.is_enabled():
+            roster_for_mmr = [p for p in payload["players"] if p["key"] != self_id]
+            mmr_client.enqueue_roster(roster_for_mmr)
+        rerender_h2h()
         update_overlay()
         print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
 
@@ -1921,6 +2405,38 @@ def main():
 
     hotkey_expand.pressed.connect(toggle_expand)
 
+    def cycle_mmr_category():
+        cur = cfg.get("mmr_category", "best")
+        try:
+            i = MMR_CATEGORIES.index(cur)
+        except ValueError:
+            i = -1
+        nxt = MMR_CATEGORIES[(i + 1) % len(MMR_CATEGORIES)]
+        cfg["mmr_category"] = nxt
+        save_config(cfg)
+        print(f"[mmr] category={nxt}", file=sys.stderr)
+        rerender_h2h()
+        update_overlay()
+
+    hotkey_cycle.pressed.connect(cycle_mmr_category)
+
+    def on_mmr_updated(_key: str):
+        # Coalesce repaints — many opponents resolving in quick succession would
+        # otherwise re-render once per arrival. The 200ms timer is single-shot
+        # and rearmed on every signal, so we only repaint after the queue lulls.
+        mmr_repaint_timer.start(200)
+
+    mmr_repaint_timer = QTimer()
+    mmr_repaint_timer.setSingleShot(True)
+
+    def _mmr_repaint():
+        if state["in_match"]:
+            rerender_h2h()
+            update_overlay()
+
+    mmr_repaint_timer.timeout.connect(_mmr_repaint)
+    mmr_client.updated.connect(on_mmr_updated)
+
     # System tray icon — gives the user a way to quit when launched via start.bat
     # (which uses pythonw and so has no console window to Ctrl+C).
     tray = None
@@ -1993,6 +2509,27 @@ def main():
         menu.addAction(wipe_history_action)
         menu.addSeparator()
 
+        mmr_action = QAction("Show MMR (sends opponent IDs to tracker.gg)")
+        mmr_action.setCheckable(True)
+        mmr_action.setChecked(bool(cfg.get("mmr_enabled", False)))
+        def _toggle_mmr(checked: bool):
+            cfg["mmr_enabled"] = bool(checked)
+            save_config(cfg)
+            mmr_client.set_enabled(bool(checked))
+            print(f"[mmr] enabled={cfg['mmr_enabled']}", file=sys.stderr)
+            # Flipping ON in the middle of a match: enqueue the current roster
+            # immediately so the user sees data without waiting for the next
+            # match. Flipping OFF: just re-render so the chips disappear.
+            if checked and state["in_match"] and state["roster"]:
+                self_id = cfg.get("self_player_id")
+                roster_for_mmr = [p for p in state["roster"] if p["key"] != self_id]
+                mmr_client.enqueue_roster(roster_for_mmr)
+            rerender_h2h()
+            update_overlay()
+        mmr_action.toggled.connect(_toggle_mmr)
+        menu.addAction(mmr_action)
+        menu.addSeparator()
+
         auto_update_action = QAction("Auto-update on launch")
         auto_update_action.setCheckable(True)
         auto_update_action.setChecked(bool(cfg.get("auto_update", False)))
@@ -2034,12 +2571,15 @@ def main():
     hotkey_h2h.start()
     hotkey_session.start()
     hotkey_expand.start()
+    hotkey_cycle.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
           f"expand={cfg.get('expand_hotkeys') or []} "
+          f"cycle={cfg.get('cycle_hotkeys') or []} "
           f"position={cfg['position']} tcp://{cfg['host']}:{cfg['port']}")
     print(f"        require_rl_focus={cfg.get('require_rl_focus', True)} "
           f"expanded={state['h2h_expanded']} "
+          f"mmr={cfg.get('mmr_enabled', False)}/{cfg.get('mmr_category', 'best')} "
           f"self={cfg.get('self_player_id') or '(auto-detect on first 1v1)'}")
     print(f"        matches → {MATCHES_PATH.name}")
     print(f"        players → {PLAYERS_PATH.name}")
@@ -2049,6 +2589,8 @@ def main():
     hotkey_h2h.stop()
     hotkey_session.stop()
     hotkey_expand.stop()
+    hotkey_cycle.stop()
+    mmr_client.stop()
     sys.exit(rc)
 
 

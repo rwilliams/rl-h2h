@@ -89,25 +89,47 @@ The overlay is **held**, not toggled. Defaults match Rocket League's stock score
 | Head-to-head         | **Tab** | **LB**  | **L1**      |
 | Session stats        | **F12** | —       | —           |
 | Toggle expanded H2H  | **F11** | —       | —           |
+| Cycle MMR category   | **F10** | —       | —           |
 
 Hold to show; release to hide. Multiple bindings can be combined; the overlay shows while *any* of them is held.
 
 **F11** toggles whether the H2H overlay also shows the session stats card underneath. The choice persists across launches (saved to `config.json`).
 
+**F10** cycles the MMR category shown next to each opponent — `best → 1v1 → 2v2 → 3v3 → best`. The active category is shown in the H2H header (`MMR · BEST`) and the footer hint. The choice persists. F10 only does anything if MMR display is enabled — see below.
+
+## MMR display
+
+Right-click the tray icon and tick **"Show MMR (sends opponent IDs to tracker.gg)"**. Off by default. Once on, every opponent's rank tier and current MMR appear under their W/L line, color-coded by rank (bronze → SSL).
+
+Defaults to "best" — the highest MMR across the three competitive playlists (1v1, 2v2, 3v3) — with a small playlist hint so you can see *which* playlist that came from. Cycle to a specific playlist with **F10**.
+
+- **Source**: `rocketleague.tracker.network`'s public JSON endpoint. No API key required.
+- **Privacy**: opponents' display names (and your own, until you exclude yourself) are sent over HTTPS to `api.tracker.gg`. The local match history, players, and config are never uploaded. Toggle off any time and the network calls stop immediately.
+- **Freshness**: tracker.network refreshes from Psyonix on demand and caches each profile for ~4 minutes server-side. We cache for 10 minutes locally (`mmr_cache.json`). MMR updates between matches with up to ~4 min lag, typically near-realtime.
+- **Throttle**: at most one outbound request every 2 seconds. A full 3v3 lobby's MMR resolves in under 6s.
+- **Lookup limit**: the tracker indexes by display name. If a console player has just renamed (or has a name that's not unique), they'll show as `—`. Epic, PSN, Xbox, Switch, Steam are all supported in principle, but coverage depends on whether the player is registered on tracker.network.
+
 ## Config
 
 Settings live in `config.json` (created on first run). The file is **gitignored**, so `git pull` never overwrites your local edits. When new options are added in a future version, your existing values are preserved and only the new keys are merged in. The top of the file has comments listing every supported keyboard and gamepad key name. Common tweaks:
 
-- `hotkeys` / `session_hotkeys` — lists of triggers, e.g. `["tab", "pad_lb"]`. Avoid D-pad bindings — stock RL maps them to quickchat.
+- `hotkeys` / `session_hotkeys` / `expand_hotkeys` / `cycle_hotkeys` — lists of triggers, e.g. `["tab", "pad_lb"]`. Avoid D-pad bindings — stock RL maps them to quickchat.
 - `position` — `top-right` (default), `top-left`, `top-center`, `bottom-right`, `bottom-left`
 - `require_rl_focus` — set to `false` to also show the overlay on the desktop
 - `self_player_id` — auto-filled after your first 1v1; set manually if you only play 2v2/3v3 (copy your `Platform|Uid` from `players.json`)
+- `mmr_enabled` — `true` enables opponent MMR lookup against tracker.network. Off by default; flip via the tray menu so you see the privacy note.
+- `mmr_category` — `"best" | "1v1" | "2v2" | "3v3"`. Cycled live with **F10**.
 
 To wipe your match history, delete `matches.jsonl` and `players.json`.
 
 ## Privacy
 
-Everything runs locally. `matches.jsonl`, `players.json`, and `config.json` never leave your machine — they're written next to the script. The script connects to `127.0.0.1:49123` only; no remote network calls anywhere in the code. The data is yours.
+By default everything runs locally. `matches.jsonl`, `players.json`, `mmr_cache.json`, and `config.json` never leave your machine — they're written next to the script. The script connects to `127.0.0.1:49123` only; no remote network calls happen unless **you opt into one** of the two features below.
+
+- **MMR display** (off by default — tray menu toggle). When enabled, the script sends each opponent's display name to `api.tracker.gg` over HTTPS to look up their public Rocket League profile. Your own player record is excluded from the lookup. Caches are local. Toggle off and the calls stop immediately.
+- **Auto-update** (off by default — tray menu toggle). When enabled, `start.bat` checks GitHub for a newer version of this script.
+
+The data is yours.
 
 ## Updates
 
@@ -132,6 +154,8 @@ The setting persists in `config.json` (`auto_update: true|false`). Launching wit
 - **Tray icon missing.** Windows hides newly-installed tray icons behind the chevron `^` next to the clock by default. Click the chevron, drag the Rocket League H2H icon onto the taskbar to pin it. Or: Settings → Personalization → Taskbar → Other system tray icons → enable `pythonw.exe`.
 - **Gamepad bindings silently ignored.** The `inputs` package needs to be installed (`pip install -r requirements.txt`). The console will say `[hotkey] gamepad listener watching: [...]` on startup if it's working.
 - **Port 49123 already in use.** Pick a different port in `DefaultStatsAPI.ini` *and* in `config.json` (`"port": 49123`) — they must match.
+- **MMR shows `—` for an opponent you can see in-game.** tracker.network indexes by display name. Console players who renamed recently, or who have a non-unique handle that collides with someone else, may not resolve. There is no way around this short of TRN updating their database. Epic players' MMR usually works because Epic display names are unique on the platform.
+- **MMR shows `…` and never resolves.** Either `curl_cffi` failed to install (re-run `pip install -r requirements.txt`) or `api.tracker.gg` is unreachable. Console output prefixes `[mmr]` will say which.
 
 ## License
 

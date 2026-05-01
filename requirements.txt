@@ -1,3 +1,4 @@
 PySide6>=6.5
 pynput>=1.7
 inputs>=0.5
+curl_cffi>=0.7
