@@ -30,7 +30,7 @@ python rl_h2h.py
 
 Or double-click `start.bat` for a windowless launch. The script can be started before or after Rocket League — it auto-reconnects.
 
-A small **`H` icon appears in the Windows system tray** (notification area, bottom-right). Right-click it for a menu: connection status, "Open data folder", and **Quit**. If you don't see it, expand the chevron `^` next to the clock — Windows hides new tray icons by default. You can pin it: drag the icon onto the taskbar.
+A small **Octane icon appears in the Windows system tray** (notification area, bottom-right). Right-click it for a menu: connection status, "Open data folder", and **Quit**. If you don't see it, expand the chevron `^` next to the clock — Windows hides new tray icons by default. You can pin it: drag the icon onto the taskbar.
 
 To update later: `git pull`.
 
@@ -66,7 +66,7 @@ Everything runs locally. `matches.jsonl`, `players.json`, and `config.json` neve
 
 - **Overlay never shows / Stats API never connects.** Make sure you fully exited Rocket League before saving `DefaultStatsAPI.ini`. The .ini is read once at launch — if RL was already running, your edits are ignored. Confirm the file contains `PacketSendRate=2` (or any non-zero) and `Port=49123`.
 - **Overlay invisible during a match.** Set RL to **Borderless** display mode (Settings → Video → Display Mode). True fullscreen owns the whole screen; no overlay can render over it.
-- **Tray icon missing.** Windows hides newly-installed tray icons behind the chevron `^` next to the clock by default. Click the chevron, drag the H icon onto the taskbar to pin it. Or: Settings → Personalization → Taskbar → Other system tray icons → enable `pythonw.exe`.
+- **Tray icon missing.** Windows hides newly-installed tray icons behind the chevron `^` next to the clock by default. Click the chevron, drag the Octane icon onto the taskbar to pin it. Or: Settings → Personalization → Taskbar → Other system tray icons → enable `pythonw.exe`.
 - **Gamepad bindings silently ignored.** The `inputs` package needs to be installed (`pip install -r requirements.txt`). The console will say `[hotkey] gamepad listener watching: [...]` on startup if it's working.
 - **Port 49123 already in use.** Pick a different port in `DefaultStatsAPI.ini` *and* in `config.json` (`"port": 49123`) — they must match.
 
