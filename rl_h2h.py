@@ -39,6 +39,15 @@ EVT_UPDATE_STATE = "UpdateState"
 EVT_MATCH_ENDED = "MatchEnded"
 EVT_MATCH_DESTROYED = "MatchDestroyed"
 EVT_REPLAY_CREATED = "ReplayCreated"
+EVT_GOAL_SCORED = "GoalScored"
+EVT_BALL_HIT = "BallHit"
+EVT_CROSSBAR_HIT = "CrossbarHit"
+EVT_STATFEED = "StatfeedEvent"
+
+# StatfeedEvent.EventName values we explicitly track.
+SF_SAVE = "Save"
+SF_SHOT = "Shot"
+SF_DEMOLISH = "Demolish"
 
 BUCKET_VS = "vs"
 BUCKET_WITH = "with"
@@ -266,7 +275,7 @@ def save_config(cfg: dict) -> None:
     out = {k: v for k, v in cfg.items() if k != "hotkey"}
     try:
         atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2))
-    except Exception as e:
+    except OSError as e:
         print(f"[config] could not save: {e}", file=sys.stderr)
 
 
@@ -278,7 +287,7 @@ def load_config() -> dict:
             loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 cfg.update(loaded)
-        except Exception as e:
+        except (json.JSONDecodeError, OSError) as e:
             print(f"[config] failed to parse {CONFIG_PATH}: {e}", file=sys.stderr)
     # Backward compat: 'hotkey' (single str) → 'hotkeys' (list).
     if not cfg.get("hotkeys"):
@@ -464,8 +473,10 @@ class StatsClient(QObject):
                     self._safe_handle(obj)
         finally:
             writer.close()
+            # wait_closed can hang on Windows when the peer socket is half-open;
+            # cap it so stop()'s 3s thread.join() always wins the race.
             with contextlib.suppress(Exception):
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
 
     def _safe_handle(self, msg) -> None:
         if not isinstance(msg, dict):
@@ -863,7 +874,7 @@ def humanize_when(iso_ts: Optional[str]) -> str:
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
         secs = int((datetime.now(timezone.utc) - t).total_seconds())
-    except Exception:
+    except (ValueError, TypeError):
         return ""
     if secs < 60:
         return "just now"
@@ -1089,8 +1100,9 @@ class SessionStats:
         return bool(name) and name == self.self_name
 
     def on_event(self, event: str, data: dict) -> None:
-        if event == "GoalScored":
-            scorer_name = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
+        if event == EVT_GOAL_SCORED:
+            scorer = data.get("Scorer")
+            scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 if sp > self.max_goal_speed:
@@ -1106,9 +1118,9 @@ class SessionStats:
                 if self._is_self(scorer_name):
                     if self.fastest_goal_time_self is None or gt < self.fastest_goal_time_self:
                         self.fastest_goal_time_self = float(gt)
-        elif event == "CrossbarHit":
+        elif event == EVT_CROSSBAR_HIT:
             self.crossbars += 1
-            last_touch = data.get("BallLastTouch") or {}
+            last_touch = data.get("BallLastTouch")
             toucher_name = None
             if isinstance(last_touch, dict):
                 p = last_touch.get("Player")
@@ -1120,25 +1132,23 @@ class SessionStats:
                     self.max_impact_force = float(ifo)
                 if self._is_self(toucher_name) and ifo > self.max_impact_force_self:
                     self.max_impact_force_self = float(ifo)
-        elif event == "BallHit":
+        elif event == EVT_BALL_HIT:
             ball = data.get("Ball")
-            sp = None
-            if isinstance(ball, dict):
-                sp = ball.get("PostHitSpeed")
+            sp = ball.get("PostHitSpeed") if isinstance(ball, dict) else None
             if isinstance(sp, (int, float)):
                 if sp > self.max_ball_speed:
                     self.max_ball_speed = float(sp)
                 # BallHit can have multiple players in the same frame — count if any is self.
                 hitters = data.get("Players")
                 if isinstance(hitters, list):
-                    if any(self._is_self((h or {}).get("Name")) for h in hitters if isinstance(h, dict)):
+                    if any(self._is_self(h.get("Name")) for h in hitters if isinstance(h, dict)):
                         if sp > self.max_ball_speed_self:
                             self.max_ball_speed_self = float(sp)
-        elif event == "StatfeedEvent":
+        elif event == EVT_STATFEED:
             ev_name = data.get("EventName")
             if isinstance(ev_name, str) and ev_name:
                 self.statfeed_counts[ev_name] = self.statfeed_counts.get(ev_name, 0) + 1
-                main = data.get("MainTarget") or {}
+                main = data.get("MainTarget")
                 if isinstance(main, dict) and self._is_self(main.get("Name")):
                     self.statfeed_counts_self[ev_name] = self.statfeed_counts_self.get(ev_name, 0) + 1
 
@@ -1196,10 +1206,10 @@ def _opt_int(v) -> str:
 
 
 def _pair_max(scope_v: float, self_v: float, always_pair: bool = False) -> str:
-    """Render a max-style stat as 'scope | yours'. Scope >= self_v always.
+    """Render a max-style or counter stat as 'scope | yours'. Scope >= self_v always.
 
-    If you own the scope max the pair collapses to a single number to keep
-    the session card compact. Pass `always_pair=True` (used by the post-match
+    If you own the scope max the pair collapses to a single number to keep the
+    session card compact. Pass `always_pair=True` (used by the post-match
     summary) to always show both values — clearer when the user explicitly
     wants 'match | mine' for every row."""
     if scope_v <= 0:
@@ -1210,15 +1220,9 @@ def _pair_max(scope_v: float, self_v: float, always_pair: bool = False) -> str:
     return f"{int(scope_v)}{_PAIR_SEP}{right}"
 
 
-def _pair_count(scope_v: int, self_v: int, always_pair: bool = False) -> str:
-    """Render a counter (saves/shots/demos/crossbars) as 'scope | yours'.
-    See `_pair_max` for the `always_pair` flag."""
-    if scope_v <= 0:
-        return EM_DASH
-    if not always_pair and self_v >= scope_v:
-        return str(int(scope_v))
-    right = str(int(self_v)) if self_v > 0 else EM_DASH
-    return f"{int(scope_v)}{_PAIR_SEP}{right}"
+# Counters (saves/shots/demos/crossbars) and maxes (speeds/forces) render the
+# same way — same int formatting, same collapse-when-you-own-it rule. Alias.
+_pair_count = _pair_max
 
 
 def _pair_fastest(scope_v: Optional[float], self_v: Optional[float], always_pair: bool = False) -> str:
@@ -1298,12 +1302,12 @@ def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
         diff_color = C_WIN if diff > 0 else C_LOSS
         goals_val += f" <span style='color:{diff_color};font-size:9pt;'>{sign}{diff}</span>"
 
-    saves_t  = s.statfeed_counts.get("Save", 0)
-    shots_t  = s.statfeed_counts.get("Shot", 0)
-    demos_t  = s.statfeed_counts.get("Demolish", 0)
-    saves_s  = s.statfeed_counts_self.get("Save", 0)
-    shots_s  = s.statfeed_counts_self.get("Shot", 0)
-    demos_s  = s.statfeed_counts_self.get("Demolish", 0)
+    saves_t  = s.statfeed_counts.get(SF_SAVE, 0)
+    shots_t  = s.statfeed_counts.get(SF_SHOT, 0)
+    demos_t  = s.statfeed_counts.get(SF_DEMOLISH, 0)
+    saves_s  = s.statfeed_counts_self.get(SF_SAVE, 0)
+    shots_s  = s.statfeed_counts_self.get(SF_SHOT, 0)
+    demos_s  = s.statfeed_counts_self.get(SF_DEMOLISH, 0)
 
     overall_rows = [
         _stat_row("Matches", matches_val),
@@ -1403,8 +1407,9 @@ class MatchStats:
         return bool(name) and name == self.self_name
 
     def on_event(self, event: str, data: dict) -> None:
-        if event == "GoalScored":
-            scorer_name = (data.get("Scorer") or {}).get("Name") if isinstance(data.get("Scorer"), dict) else None
+        if event == EVT_GOAL_SCORED:
+            scorer = data.get("Scorer")
+            scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
             sp = data.get("GoalSpeed")
             if isinstance(sp, (int, float)):
                 self.max_goal_speed = max(self.max_goal_speed, float(sp))
@@ -1417,17 +1422,17 @@ class MatchStats:
                 if self._is_self(scorer_name):
                     if self.fastest_goal_time_self is None or gt < self.fastest_goal_time_self:
                         self.fastest_goal_time_self = float(gt)
-        elif event == "BallHit":
+        elif event == EVT_BALL_HIT:
             ball = data.get("Ball")
             sp = ball.get("PostHitSpeed") if isinstance(ball, dict) else None
             if isinstance(sp, (int, float)):
                 self.max_ball_speed = max(self.max_ball_speed, float(sp))
                 hitters = data.get("Players")
                 if isinstance(hitters, list) and any(
-                    self._is_self((h or {}).get("Name")) for h in hitters if isinstance(h, dict)
+                    self._is_self(h.get("Name")) for h in hitters if isinstance(h, dict)
                 ):
                     self.max_ball_speed_self = max(self.max_ball_speed_self, float(sp))
-        elif event == "CrossbarHit":
+        elif event == EVT_CROSSBAR_HIT:
             self.crossbars += 1
             last_touch = data.get("BallLastTouch")
             toucher = None
@@ -1442,21 +1447,21 @@ class MatchStats:
                 self.max_impact_force = max(self.max_impact_force, float(ifo))
                 if self._is_self(toucher):
                     self.max_impact_force_self = max(self.max_impact_force_self, float(ifo))
-        elif event == "StatfeedEvent":
+        elif event == EVT_STATFEED:
             ev = data.get("EventName")
-            main = data.get("MainTarget") or {}
-            sec = data.get("SecondaryTarget") or {}
+            main = data.get("MainTarget")
+            sec = data.get("SecondaryTarget")
             main_name = main.get("Name") if isinstance(main, dict) else None
             sec_name = sec.get("Name") if isinstance(sec, dict) else None
-            if ev == "Save":
+            if ev == SF_SAVE:
                 self.saves += 1
                 if self._is_self(main_name):
                     self.saves_self += 1
-            elif ev == "Shot":
+            elif ev == SF_SHOT:
                 self.shots += 1
                 if self._is_self(main_name):
                     self.shots_self += 1
-            elif ev == "Demolish":
+            elif ev == SF_DEMOLISH:
                 self.demos += 1
                 if self._is_self(main_name):
                     self.demos_self += 1
@@ -1483,9 +1488,9 @@ def _session_has_split(s: SessionStats) -> bool:
         s.max_goal_speed > s.max_goal_speed_self
         or s.max_ball_speed > s.max_ball_speed_self
         or s.max_impact_force > s.max_impact_force_self
-        or s.statfeed_counts.get("Save", 0) > s.statfeed_counts_self.get("Save", 0)
-        or s.statfeed_counts.get("Shot", 0) > s.statfeed_counts_self.get("Shot", 0)
-        or s.statfeed_counts.get("Demolish", 0) > s.statfeed_counts_self.get("Demolish", 0)
+        or s.statfeed_counts.get(SF_SAVE, 0) > s.statfeed_counts_self.get(SF_SAVE, 0)
+        or s.statfeed_counts.get(SF_SHOT, 0) > s.statfeed_counts_self.get(SF_SHOT, 0)
+        or s.statfeed_counts.get(SF_DEMOLISH, 0) > s.statfeed_counts_self.get(SF_DEMOLISH, 0)
     )
 
 
@@ -1895,6 +1900,10 @@ def main():
 
         wipe_history_action = QAction("Wipe match history…")
         def _wipe_history():
+            # Drain any queued match_ended slot first — otherwise a match that
+            # ended just before the user clicked Wipe would write its record
+            # *after* we've shown the dialog, and then we'd silently delete it.
+            QApplication.processEvents()
             reply = QMessageBox.question(
                 None,
                 "Wipe match history",
@@ -1911,6 +1920,10 @@ def main():
                 except OSError as e:
                     print(f"[reset] failed to delete {path.name}: {e}", file=sys.stderr)
             players_db.clear()
+            # The cached H2H card was rendered against the now-wiped opponent
+            # records — refresh so a held Tab during this match doesn't show
+            # stale W/L counts. (Idle text until the next match starts.)
+            state["h2h_html"] = idle_html("History wiped — fresh start.")
             print("[reset] match history wiped", file=sys.stderr)
             update_overlay()
         wipe_history_action.triggered.connect(_wipe_history)
@@ -1935,7 +1948,16 @@ def main():
         tray.setContextMenu(menu)
         tray.show()
 
+        # Skip the Qt setText/setToolTip churn when the connection state hasn't
+        # changed — connection_status emits on every reconnect attempt failure
+        # during a backoff storm, and Qt does compare strings, but building the
+        # f-string and crossing the C++ boundary is wasted work.
+        last_tray_state = [None]  # boxed for closure assignment
+
         def update_tray_status(connected: bool):
+            if last_tray_state[0] == connected:
+                return
+            last_tray_state[0] = connected
             label = "Connected" if connected else "Disconnected"
             if status_action is not None:
                 status_action.setText(f"Status: {label}")

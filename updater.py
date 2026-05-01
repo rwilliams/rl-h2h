@@ -23,10 +23,8 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 import zipfile
@@ -35,7 +33,13 @@ from pathlib import Path
 
 REPO = "Florentde29/rl-h2h"
 BRANCH = "main"
-TIMEOUT = 5.0
+# 5s for cheap probes (SHA endpoint, git --version, rev-parse), 30s for the
+# operations that actually transfer data (git fetch/pull, zip download).
+TIMEOUT_PROBE = 5.0
+TIMEOUT_NETWORK = 30.0
+# Hard cap on the total uncompressed size of the archive we'll extract.
+# Defends against zip-bomb scenarios if the upstream repo is ever compromised.
+MAX_ARCHIVE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 APP_DIR = Path(__file__).resolve().parent
 VERSION_PATH = APP_DIR / "VERSION"
@@ -84,7 +88,7 @@ def have_git() -> bool:
         return False
     try:
         r = subprocess.run(["git", "--version"], capture_output=True,
-                           timeout=TIMEOUT, check=False)
+                           timeout=TIMEOUT_PROBE, check=False)
         return r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -92,13 +96,13 @@ def have_git() -> bool:
 
 def git_update() -> None:
     """Fast-forward to origin/main if clean. Skip if dirty or already current."""
-    def git(*args: str) -> subprocess.CompletedProcess:
+    def git(*args: str, timeout: float = TIMEOUT_PROBE) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["git", "-C", str(APP_DIR), *args],
-            capture_output=True, text=True, timeout=TIMEOUT, check=False,
+            capture_output=True, text=True, timeout=timeout, check=False,
         )
 
-    fetch = git("fetch", "--quiet", "origin", BRANCH)
+    fetch = git("fetch", "--quiet", "origin", BRANCH, timeout=TIMEOUT_NETWORK)
     if fetch.returncode != 0:
         log(f"git: fetch failed: {fetch.stderr.strip() or fetch.stdout.strip()}")
         return
@@ -117,19 +121,19 @@ def git_update() -> None:
         log(f"git: skipped — local edits ({local[:7]} → {upstream[:7]})")
         return
 
-    pull = git("pull", "--ff-only", "--quiet", "origin", BRANCH)
+    pull = git("pull", "--ff-only", "--quiet", "origin", BRANCH, timeout=TIMEOUT_NETWORK)
     if pull.returncode != 0:
         log(f"git: pull failed: {pull.stderr.strip() or pull.stdout.strip()}")
         return
     log(f"git: updated {local[:7]} → {upstream[:7]}")
 
 
-def http_get(url: str, accept: str | None = None) -> bytes:
+def http_get(url: str, accept: str | None = None, timeout: float = TIMEOUT_PROBE) -> bytes:
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "rl-h2h-updater")
     if accept:
         req.add_header("Accept", accept)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -186,16 +190,28 @@ def zip_update() -> None:
     # Download and stage.
     try:
         zip_bytes = http_get(
-            f"https://github.com/{REPO}/archive/refs/heads/{BRANCH}.zip"
+            f"https://github.com/{REPO}/archive/refs/heads/{BRANCH}.zip",
+            timeout=TIMEOUT_NETWORK,
         )
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"zip: archive download failed: {type(e).__name__}: {e}")
         return
 
+    app_root = APP_DIR.resolve()
     new_tree: dict[str, str] = {}
+    # Two-phase commit: write every new file to a sibling .tmp, then in a tight
+    # second loop atomically rename them all into place. If we crash between
+    # phases the working tree is untouched (only orphan .tmp files remain). The
+    # rename phase is fast enough that a crash window inside it is negligible.
+    staged: list[tuple[Path, Path]] = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             members = zf.infolist()
+            # Bomb cap: reject if the total uncompressed size is suspicious.
+            total_size = sum(max(0, m.file_size) for m in members)
+            if total_size > MAX_ARCHIVE_SIZE:
+                log(f"zip: archive too large ({total_size} bytes > {MAX_ARCHIVE_SIZE})")
+                return
             # GitHub wraps everything in <repo>-<branch>/...
             roots = {m.filename.split("/", 1)[0] for m in members if "/" in m.filename}
             if len(roots) != 1:
@@ -208,17 +224,36 @@ def zip_update() -> None:
                 rel = m.filename[len(root):]
                 if not rel or is_protected(rel):
                     continue
+                # Zipslip guard: reject any path that resolves outside APP_DIR.
+                # GitHub archives are clean today, but this is the kind of bug
+                # that makes a future repo compromise an RCE.
+                dest = (APP_DIR / rel).resolve()
+                if app_root not in dest.parents and dest != app_root:
+                    log(f"zip: skipped suspicious path {rel!r}")
+                    continue
                 data = zf.read(m)
-                dest = APP_DIR / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                # Write atomically.
                 tmp = dest.with_suffix(dest.suffix + ".tmp")
                 with tmp.open("wb") as f:
                     f.write(data)
-                os.replace(tmp, dest)
+                staged.append((tmp, dest))
                 new_tree[rel] = sha256_bytes(data)
     except (zipfile.BadZipFile, OSError) as e:
+        # Clean up any staging files we created so they don't litter the repo.
+        for tmp, _ in staged:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         log(f"zip: extract failed: {type(e).__name__}: {e}")
+        return
+
+    # Phase 2: atomic per-file rename. Fast (no I/O / decompression).
+    try:
+        for tmp, dest in staged:
+            os.replace(tmp, dest)
+    except OSError as e:
+        log(f"zip: rename phase failed: {type(e).__name__}: {e}")
         return
 
     try:
