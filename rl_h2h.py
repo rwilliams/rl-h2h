@@ -1502,6 +1502,16 @@ def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats])
         "letter-spacing:0.02em;padding:1px 0;'>{content}</td>"
     )
 
+    # Format row first — explanatory info above the actionable hotkey row.
+    if session is not None and _session_has_split(session):
+        rows.append(
+            "<tr>"
+            + cell.format(align="left",  C_MUTED=C_MUTED, content="Format")
+            + cell.format(align="right", C_MUTED=C_MUTED,
+                          content="<b>session</b> | yours")
+            + "</tr>"
+        )
+
     h_left = ""
     h_right = ""
     if expand_label:
@@ -1514,15 +1524,6 @@ def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats])
             "<tr>"
             + cell.format(align="left",  C_MUTED=C_MUTED, content=h_left)
             + cell.format(align="right", C_MUTED=C_MUTED, content=h_right)
-            + "</tr>"
-        )
-
-    if session is not None and _session_has_split(session):
-        rows.append(
-            "<tr>"
-            + cell.format(align="left",  C_MUTED=C_MUTED, content="Format")
-            + cell.format(align="right", C_MUTED=C_MUTED,
-                          content="<b>session</b> | yours")
             + "</tr>"
         )
 
