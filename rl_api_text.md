@@ -210,38 +210,40 @@ Ball hit a crossbar.
 }
 ```
 
-##### Detecting own-goals
+##### Detecting own-goals (and the placeholder-event quirk)
 
-The API has **no own-goal flag**. `Scorer.TeamNum` is the team of the
-player who put the ball into the net, regardless of whose net it went
-into. There are two viable derivations:
+The API has **no own-goal flag**, and RL's accounting model doesn't
+treat own-goals as a category at all: every goal is credited to a
+player on the team whose score went up. So when you put the ball in
+your own net, `Scorer.TeamNum` is the *opposing* team's number, and
+`Scorer.Name` is whichever opposing player RL picks (typically the last
+opponent who touched the ball before you deflected it in). The
+score-delta heuristic does **not** work for this reason: by the time
+the score updates, RL has already rebadged the goal as a normal goal
+for the other team.
 
-1. **Score-delta (canonical, robust):** snapshot
-   `Game.Teams[i].Score` from the latest `UpdateState` at the moment
-   `GoalScored` fires, then watch the *next* `UpdateState`. Whichever
-   team's count actually went up is the beneficiary. If that's not
-   `Scorer.TeamNum`, it's an own-goal. Works on every arena (standard,
-   hoops, dropshot, snowday, labs).
-2. **Coordinate-Y (instant, arena-dependent):** in standard arenas
-   Blue's net is at `Y ≈ −5120` and Orange's at `Y ≈ +5120`. So
-   `ImpactLocation.Y < 0` means Orange scored (or Blue own-goaled);
-   `Y > 0` means Blue scored (or Orange own-goaled). Compare to
-   `Scorer.TeamNum`. Faster than #1 (no waiting) but assumes the Y-axis
-   convention, which can break on non-standard layouts.
+The only reliable signal is **`BallLastTouch.Player.TeamNum`**:
 
-Note that `GoalScored` and the corresponding score-bumped `UpdateState`
-can arrive in either order, so a **deferred-attribution queue** is the
-clean implementation: queue every `GoalScored` with its
-score-snapshot at queue time, drain on every `UpdateState` (and on
-`MatchEnded`/`MatchDestroyed`), and emit the enriched event with a
-synthetic `bOwnGoal: bool` field. This is what `rl_h2h.py` does in
-`StatsClient._drain_pending_goals`.
+- Compare it against `Scorer.TeamNum`.
+- If they match → normal goal.
+- If they differ → own-goal. The actual "scorer" (in the colloquial
+  sense — the player who put the ball in their own net) is
+  `BallLastTouch.Player.Name`, **not** `Scorer.Name`.
 
-Edge case: two goals in the same `UpdateState` window (rare, possible at
-low `PacketSendRate`) are ambiguous via score-delta alone — both teams'
-scores went up. The pragmatic fallback is to default to
-`bOwnGoal=False` for these pile-ups; the coordinate-Y check could
-disambiguate but adds complexity for a corner case.
+**Placeholder GoalScored events.** RL emits *two* `GoalScored` events
+around each goal:
+
+1. The real one, with full `Scorer` info.
+2. A placeholder, with `Scorer.Name == ""` and `Scorer.TeamNum == 0`
+   (Python's default int).
+
+For a normal goal, the real event arrives first and the placeholder
+follows after the kickoff. For an own-goal (where RL has to compute
+credit during the replay), the placeholder arrives first and the real
+event follows once credit is assigned. Either way, **drop placeholders
+where `Scorer.Name` is empty** — they're not actionable.
+
+This is what `rl_h2h.py` does in `StatsClient._classify_goal_scored`.
 
 #### `StatfeedEvent`
 Fires whenever a player earns a stat (demos, saves, etc).

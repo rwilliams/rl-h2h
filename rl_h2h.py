@@ -404,10 +404,6 @@ class StatsClient(QObject):
         self._score: list[int] = [0, 0]
         self._team_colors: dict[int, str] = {}
         self._in_replay = False
-        # GoalScored has no own-goal flag; we infer it by comparing scorer's
-        # team to which side's score actually went up. Each entry is
-        # (data, score_snapshot_at_queue_time).
-        self._pending_goals: list[tuple[dict, list[int]]] = []
 
     def start(self):
         self._thread.start()
@@ -505,16 +501,15 @@ class StatsClient(QObject):
                 data = {}
         if not isinstance(data, dict):
             data = {}
-        # GoalScored is held back until the next UpdateState confirms which team's
-        # score went up — that's how we infer own-goals. All other events emit
-        # immediately so consumers see them in real time.
+        # GoalScored: detect own-goals by comparing Scorer.TeamNum to the team
+        # of the last player to touch the ball (BallLastTouch). RL credits goals
+        # to the last *opposing* player who touched it, so an own-goal shows up
+        # as "scorer is on the team opposite to whoever actually put the ball in
+        # the net". RL also emits placeholder GoalScored events with empty
+        # scorer info — those are dropped.
         if event == EVT_GOAL_SCORED:
-            scorer = data.get("Scorer") if isinstance(data.get("Scorer"), dict) else {}
-            print(f"[goal] queued: scorer={scorer.get('Name')!r} "
-                  f"scorer_team={scorer.get('TeamNum')} "
-                  f"snapshot_score={list(self._score)} "
-                  f"my_team={self._my_team}", file=sys.stderr)
-            self._pending_goals.append((data, list(self._score)))
+            if self._classify_goal_scored(data):
+                self.event_seen.emit(event, data)
         elif event:
             self.event_seen.emit(event, data)
         if event == EVT_UPDATE_STATE:
@@ -534,7 +529,6 @@ class StatsClient(QObject):
         elif event == EVT_MATCH_ENDED:
             self._on_match_ended(data)
         elif event == EVT_MATCH_DESTROYED:
-            self._drain_pending_goals(why="match_destroyed")
             self.match_destroyed.emit()
             self._reset()
         elif event == EVT_REPLAY_CREATED:
@@ -558,11 +552,6 @@ class StatsClient(QObject):
                         continue
                     sc = t.get("Score")
                     if isinstance(sc, int):
-                        prev = self._score[int(tn)]
-                        if sc != prev:
-                            print(f"[goal] score change: team {int(tn)} "
-                                  f"{prev}→{sc} (full={[*self._score[:int(tn)], sc, *self._score[int(tn)+1:]]})",
-                                  file=sys.stderr)
                         self._score[int(tn)] = sc
                     # Skip color capture once both teams' colors are known.
                     if len(self._team_colors) < 2:
@@ -570,9 +559,6 @@ class StatsClient(QObject):
                         if (int(tn) not in self._team_colors and isinstance(cp, str)
                                 and len(cp) == 6):
                             self._team_colors[int(tn)] = "#" + cp.upper()
-        # Now that the score reflects this tick, attribute any GoalScored events
-        # that were waiting for a score-delta to confirm own-goal vs normal.
-        self._drain_pending_goals(why="update_state")
         # Once the round has actually started (kickoff fired), the roster is locked.
         # Until then we keep accumulating — players load asynchronously in 2v2/3v3.
         if self._round_started:
@@ -617,9 +603,6 @@ class StatsClient(QObject):
     def _on_match_ended(self, data: dict):
         if self._in_replay:
             return
-        # Drain before MatchEnded fires — once `state["in_match"]` flips to False,
-        # SessionStats stops processing events, so any pending goals would be lost.
-        self._drain_pending_goals(why="match_ended")
         winner = data.get("WinnerTeamNum")
         if winner is None or self._my_team is None or not self._roster:
             return
@@ -633,56 +616,46 @@ class StatsClient(QObject):
             "teamColors": dict(self._team_colors),
         })
 
-    def _drain_pending_goals(self, why: str = "tick") -> None:
-        """Resolve queued GoalScored events whose own-goal status is now visible.
+    def _classify_goal_scored(self, data: dict) -> bool:
+        """Decide whether a GoalScored event is a real, attributable goal.
 
-        Compares each entry's score snapshot to the current score. Whichever
-        team's count actually went up is the beneficiary; if that's not the
-        scorer's team, it's an own-goal. Entries with no observable delta
-        stay queued for the next tick. Ambiguous cases (both deltas non-zero,
-        which only happens with multi-goal pile-ups) emit pessimistically as
-        not-own-goal — false positives for own-goal would be more annoying.
+        Mutates `data` in-place to set `bOwnGoal: bool`. Returns True if the
+        event should be emitted to consumers, False to drop it.
+
+        RL emits two GoalScored events around each goal: one with the credited
+        scorer's info (the real one), and one with empty scorer info — a
+        placeholder fired around the kickoff/replay transitions. Drop the
+        placeholders.
+
+        Own-goal detection: RL credits every goal to a player on the team
+        whose score went up, even when the actual *last touch* was by a
+        player on the opposing team (the classic deflect-into-own-net case).
+        Compare `Scorer.TeamNum` against `BallLastTouch.Player.TeamNum`:
+        when they differ, it's an own-goal.
         """
-        if not self._pending_goals:
-            return
-        current = self._score
-        remaining: list[tuple[dict, list[int]]] = []
-        for data, snapshot in self._pending_goals:
-            scorer = data.get("Scorer") if isinstance(data.get("Scorer"), dict) else {}
-            scorer_team = scorer.get("TeamNum") if isinstance(scorer, dict) else None
-            if scorer_team not in (0, 1):
-                data["bOwnGoal"] = False
-                print(f"[goal] drain ({why}): malformed scorer_team={scorer_team!r}; "
-                      f"emitting bOwnGoal=False", file=sys.stderr)
-                self.event_seen.emit(EVT_GOAL_SCORED, data)
-                continue
-            d_scorer = current[scorer_team] - snapshot[scorer_team]
-            d_other = current[1 - scorer_team] - snapshot[1 - scorer_team]
-            if d_scorer > 0 and d_other == 0:
-                data["bOwnGoal"] = False
-                print(f"[goal] drain ({why}): NORMAL scorer={scorer.get('Name')!r} "
-                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
-                      f"d_scorer={d_scorer} d_other={d_other}", file=sys.stderr)
-                self.event_seen.emit(EVT_GOAL_SCORED, data)
-            elif d_other > 0 and d_scorer == 0:
-                data["bOwnGoal"] = True
-                print(f"[goal] drain ({why}): OWN-GOAL scorer={scorer.get('Name')!r} "
-                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
-                      f"d_scorer={d_scorer} d_other={d_other}", file=sys.stderr)
-                self.event_seen.emit(EVT_GOAL_SCORED, data)
-            elif d_scorer == 0 and d_other == 0:
-                print(f"[goal] drain ({why}): DEFER scorer={scorer.get('Name')!r} "
-                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
-                      f"(no delta yet)", file=sys.stderr)
-                remaining.append((data, snapshot))
-            else:
-                data["bOwnGoal"] = False
-                print(f"[goal] drain ({why}): AMBIGUOUS scorer={scorer.get('Name')!r} "
-                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
-                      f"d_scorer={d_scorer} d_other={d_other}; "
-                      f"defaulting bOwnGoal=False", file=sys.stderr)
-                self.event_seen.emit(EVT_GOAL_SCORED, data)
-        self._pending_goals = remaining
+        scorer = data.get("Scorer") if isinstance(data.get("Scorer"), dict) else None
+        scorer_name = scorer.get("Name") if scorer else None
+        if not scorer_name:
+            print(f"[goal] dropped placeholder event (empty scorer)", file=sys.stderr)
+            return False
+        scorer_team = scorer.get("TeamNum") if scorer else None
+        last_touch = data.get("BallLastTouch") if isinstance(data.get("BallLastTouch"), dict) else None
+        last_player = (last_touch.get("Player")
+                       if last_touch and isinstance(last_touch.get("Player"), dict)
+                       else None)
+        last_team = last_player.get("TeamNum") if last_player else None
+        last_name = last_player.get("Name") if last_player else None
+        is_own_goal = (
+            scorer_team in (0, 1)
+            and last_team in (0, 1)
+            and scorer_team != last_team
+        )
+        data["bOwnGoal"] = is_own_goal
+        print(f"[goal] {'OWN-GOAL' if is_own_goal else 'NORMAL'}: "
+              f"scorer={scorer_name!r} (team {scorer_team}) "
+              f"last_touch={last_name!r} (team {last_team})",
+              file=sys.stderr)
+        return True
 
     def _maybe_emit_initialized(self):
         if (self._initialized_emitted or self._in_replay
@@ -1186,15 +1159,20 @@ class SessionStats:
         if event == EVT_GOAL_SCORED:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
-            is_own_goal = bool(data.get("bOwnGoal"))
-            if is_own_goal:
+            if data.get("bOwnGoal"):
                 self.own_goals += 1
-                if self._is_self(scorer_name):
+                # The "scorer" of an own-goal is the opposing player credited by
+                # RL — not the actual culprit. Use BallLastTouch.Player to find
+                # who actually put it in their own net.
+                last_touch = data.get("BallLastTouch")
+                last_player = (last_touch.get("Player")
+                               if isinstance(last_touch, dict)
+                                  and isinstance(last_touch.get("Player"), dict)
+                               else None)
+                if self._is_self(last_player.get("Name") if last_player else None):
                     self.own_goals_self += 1
-            # Don't credit own-goals as your "fastest" or "fastest self" — feeding
-            # the net shouldn't show up as a personal best.
             sp = data.get("GoalSpeed")
-            if not is_own_goal and isinstance(sp, (int, float)):
+            if isinstance(sp, (int, float)):
                 if sp > self.max_goal_speed:
                     self.max_goal_speed = float(sp)
                 if self._is_self(scorer_name) and sp > self.max_goal_speed_self:
@@ -1202,7 +1180,7 @@ class SessionStats:
             gt = data.get("GoalTime")
             # Filter out 0 — it's an API artifact (e.g. first goal of a session, or
             # instant goals) that would otherwise pin "fastest goal" to 0 forever.
-            if not is_own_goal and isinstance(gt, (int, float)) and gt > 0:
+            if isinstance(gt, (int, float)) and gt > 0:
                 if self.fastest_goal_time is None or gt < self.fastest_goal_time:
                     self.fastest_goal_time = float(gt)
                 if self._is_self(scorer_name):
@@ -1504,18 +1482,22 @@ class MatchStats:
         if event == EVT_GOAL_SCORED:
             scorer = data.get("Scorer")
             scorer_name = scorer.get("Name") if isinstance(scorer, dict) else None
-            is_own_goal = bool(data.get("bOwnGoal"))
-            if is_own_goal:
+            if data.get("bOwnGoal"):
                 self.own_goals += 1
-                if self._is_self(scorer_name):
+                last_touch = data.get("BallLastTouch")
+                last_player = (last_touch.get("Player")
+                               if isinstance(last_touch, dict)
+                                  and isinstance(last_touch.get("Player"), dict)
+                               else None)
+                if self._is_self(last_player.get("Name") if last_player else None):
                     self.own_goals_self += 1
             sp = data.get("GoalSpeed")
-            if not is_own_goal and isinstance(sp, (int, float)):
+            if isinstance(sp, (int, float)):
                 self.max_goal_speed = max(self.max_goal_speed, float(sp))
                 if self._is_self(scorer_name):
                     self.max_goal_speed_self = max(self.max_goal_speed_self, float(sp))
             gt = data.get("GoalTime")
-            if not is_own_goal and isinstance(gt, (int, float)) and gt > 0:
+            if isinstance(gt, (int, float)) and gt > 0:
                 if self.fastest_goal_time is None or gt < self.fastest_goal_time:
                     self.fastest_goal_time = float(gt)
                 if self._is_self(scorer_name):
