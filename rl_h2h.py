@@ -34,6 +34,7 @@ MATCHES_PATH = APP_DIR / "matches.jsonl"
 PLAYERS_PATH = APP_DIR / "players.json"
 MMR_CACHE_PATH = APP_DIR / "mmr_cache.json"
 MMR_LOG_PATH = APP_DIR / "mmr.log"
+MY_MMR_LOG_PATH = APP_DIR / "my_mmr.log"
 
 
 EVT_MATCH_CREATED = "MatchCreated"
@@ -651,9 +652,11 @@ class MMRClient(QObject):
         age = (datetime.now(timezone.utc) - t).total_seconds()
         return age >= self._ttl
 
-    def enqueue(self, primary_id: str, name: str) -> None:
-        """Queue a refresh for this opponent. Skips if disabled, already
-        in-flight, or cache is fresh enough."""
+    def enqueue(self, primary_id: str, name: str, force: bool = False) -> None:
+        """Queue a refresh for this opponent. Skips if disabled or already
+        in-flight; also skips on cache-fresh unless `force=True`. Use force
+        for after-match self refresh, where we want the absolute latest TRN
+        has even if our local cache is technically still warm."""
         key = player_key(primary_id)
         if not self._enabled:
             mmr_log(f"enqueue skip {key!r} ({name!r}): disabled")
@@ -664,12 +667,13 @@ class MMRClient(QObject):
         if key in self._inflight:
             mmr_log(f"enqueue skip {key!r} ({name!r}): already in-flight")
             return
-        with self._cache_lock:
-            entry = self._cache.get(key)
-        if not self._is_stale(entry):
-            mmr_log(f"enqueue skip {key!r} ({name!r}): cache fresh "
-                    f"(fetched_at={entry.get('fetched_at')!r})")
-            return
+        if not force:
+            with self._cache_lock:
+                entry = self._cache.get(key)
+            if not self._is_stale(entry):
+                mmr_log(f"enqueue skip {key!r} ({name!r}): cache fresh "
+                        f"(fetched_at={entry.get('fetched_at')!r})")
+                return
         handle = mmr_lookup_handle(primary_id, name)
         if handle is None:
             mmr_log(f"enqueue skip {key!r} ({name!r}): unsupported platform "
@@ -678,7 +682,8 @@ class MMRClient(QObject):
         plat, ident = handle
         self._inflight.add(key)
         self._queue.put((key, plat, ident))
-        mmr_log(f"enqueue {key!r} -> {plat}/{ident!r} (queue size={self._queue.qsize()})")
+        mmr_log(f"enqueue{' [forced]' if force else ''} {key!r} -> "
+                f"{plat}/{ident!r} (queue size={self._queue.qsize()})")
 
     def enqueue_roster(self, roster: list[dict]) -> None:
         """Convenience: queue every player in a match roster."""
@@ -1397,7 +1402,17 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             f"<span style='color:{C_WIN};font-size:8pt;font-weight:700;"
             "letter-spacing:0.16em;'>YOU</span>"
         )
-        sub_row = ""
+        # Show your own MMR in the sub-row when MMR is enabled — useful for
+        # tracking how the number moves between matches without leaving the
+        # overlay. Same chip shape as opponents.
+        self_chip = ""
+        if mmr_enabled:
+            self_entry = (mmr_db or {}).get(p["key"])
+            self_chip = _render_mmr_chip(self_entry, mmr_category, mmr_enabled)
+        sub_row = (
+            f"<tr><td colspan='2' style='padding:0 0 2px 0;'>{self_chip}</td></tr>"
+            if self_chip else ""
+        )
         return (
             "<table width='100%' cellspacing='0' cellpadding='0' "
             "style='border-collapse:collapse;margin:0;'>"
@@ -1407,6 +1422,7 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
             "<td align='right' style='padding:3px 0 0 0;white-space:nowrap;'>"
             f"{stat_cell}</td>"
             "</tr>"
+            f"{sub_row}"
             "</table>"
         )
 
@@ -2392,14 +2408,14 @@ def main():
         state["my_team"] = payload["myTeam"]
         state["arena"] = payload["arena"]
         state["team_colors"] = payload.get("teamColors") or {}
-        # Skip self when querying TRN — no point hammering the API for our own
-        # MMR every match. Other rows enqueue immediately; cached entries serve
-        # instantly, fresh entries arrive over the next ~1s per opponent.
+        # Self IS included now — we want to see our own MMR in the YOU row,
+        # and the post-match refresh in on_ended only works if self has been
+        # enqueued at least once. Cached entries serve instantly, fresh ones
+        # arrive over the next ~1s per player.
         if mmr_client.is_enabled():
-            roster_for_mmr = [p for p in payload["players"] if p["key"] != self_id]
-            mmr_log(f"on_initialized: enqueueing {len(roster_for_mmr)} opponent(s) "
-                    f"(self_id={self_id!r})")
-            mmr_client.enqueue_roster(roster_for_mmr)
+            mmr_log(f"on_initialized: enqueueing {len(payload['players'])} player(s) "
+                    f"(including self={self_id!r})")
+            mmr_client.enqueue_roster(payload["players"])
         else:
             mmr_log(f"on_initialized: MMR disabled, skipping enqueue "
                     f"(enabled_flag={cfg.get('mmr_enabled', False)}, "
@@ -2430,6 +2446,24 @@ def main():
             mt = payload["myTeam"]
             score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
+        # Force-refresh self MMR after the match. TRN's server-side cache is
+        # 4 min, Psyonix updates instantly — schedule one refresh now (likely
+        # stale) and another at +30s (likely fresh) so we capture the delta
+        # in my_mmr.log even when TRN's edge happened to be hot.
+        self_id = cfg.get("self_player_id")
+        if mmr_client.is_enabled() and self_id:
+            self_player = next((p for p in payload["players"]
+                                if p["key"] == self_id), None)
+            if self_player:
+                pid = self_player.get("primaryId") or self_player["key"]
+                name = self_player.get("name") or ""
+                mmr_log(f"on_ended: forcing self MMR refresh now + at +30s")
+                mmr_client.enqueue(pid, name, force=True)
+                # Single-shot delayed refresh — give TRN time to roll its cache.
+                QTimer.singleShot(
+                    30_000,
+                    lambda: mmr_client.enqueue(pid, name, force=True),
+                )
         # Auto-popup the post-match summary card. Stays up until the next match
         # starts (match_initialized) or the user leaves to the menu (match_destroyed),
         # with a 30s safety net for cases where neither event fires.
@@ -2497,7 +2531,65 @@ def main():
 
     hotkey_cycle.pressed.connect(cycle_mmr_category)
 
-    def on_mmr_updated(_key: str):
+    # Tracks the last self entry we logged, so we can compute deltas without
+    # re-reading my_mmr.log on every refresh. Seeded with whatever's in cache
+    # at startup so the first post-restart entry shows a delta from the
+    # previous session's last value.
+    last_self_log = {"playlists": {}}
+
+    def _log_my_mmr(entry: dict):
+        """Append one line per refresh to my_mmr.log with the per-playlist MMR
+        and the delta vs. the previous entry. Lets you eyeball whether MMR
+        moves between matches in real time."""
+        prev = last_self_log["playlists"]
+        cur = entry.get("playlists") or {}
+        parts = []
+        for label in ("1v1", "2v2", "3v3"):
+            cv = cur.get(label, {}).get("mmr")
+            pv = prev.get(label, {}).get("mmr")
+            if cv is None:
+                parts.append(f"{label}=—")
+                continue
+            if pv is None:
+                parts.append(f"{label}={cv}")
+            elif cv == pv:
+                parts.append(f"{label}={cv} (·)")
+            else:
+                parts.append(f"{label}={cv} ({cv - pv:+d})")
+        best = entry.get("best") or {}
+        best_part = (
+            f"best={best.get('mmr')}@{best.get('playlist')}"
+            if best else "best=—"
+        )
+        last_updated = entry.get("lastUpdated") or "?"
+        line = (
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"{'  '.join(parts)}  {best_part}  "
+            f"trn_lastUpdated={last_updated}"
+        )
+        try:
+            with MY_MMR_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            mmr_log(f"my_mmr.log write failed: {e}")
+        last_self_log["playlists"] = cur
+
+    # Seed last_self_log from disk cache so deltas span restarts.
+    self_id = cfg.get("self_player_id")
+    if self_id:
+        existing_self = mmr_client.get(self_id)
+        if existing_self and not existing_self.get("not_found"):
+            last_self_log["playlists"] = existing_self.get("playlists") or {}
+            mmr_log(f"seed last_self_log from cache: "
+                    f"{list(last_self_log['playlists'].keys())}")
+
+    def on_mmr_updated(key: str):
+        # Self MMR refresh? Mirror the snapshot to my_mmr.log for tracking.
+        sid = cfg.get("self_player_id")
+        if sid and key == sid:
+            entry = mmr_client.get(key)
+            if entry and not entry.get("not_found"):
+                _log_my_mmr(entry)
         # Coalesce repaints — many opponents resolving in quick succession would
         # otherwise re-render once per arrival. The 200ms timer is single-shot
         # and rearmed on every signal, so we only repaint after the queue lulls.
@@ -2600,10 +2692,8 @@ def main():
             # immediately so the user sees data without waiting for the next
             # match. Flipping OFF: just re-render so the chips disappear.
             if checked and state["in_match"] and state["roster"]:
-                self_id = cfg.get("self_player_id")
-                roster_for_mmr = [p for p in state["roster"] if p["key"] != self_id]
-                mmr_log(f"  in-match enqueue {len(roster_for_mmr)} opponent(s)")
-                mmr_client.enqueue_roster(roster_for_mmr)
+                mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
+                mmr_client.enqueue_roster(state["roster"])
             rerender_h2h()
             update_overlay()
         mmr_action.toggled.connect(_toggle_mmr)
