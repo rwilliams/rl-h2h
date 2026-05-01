@@ -169,8 +169,8 @@ DEFAULT_CONFIG = {
     "position": "top-right",
     "margin": 24,
     "width": 380,
-    "background_rgba": [14, 16, 20, 225],
-    "text_color": "#F2F4F7",
+    "background_rgba": [16, 20, 21, 200],
+    "text_color": "#E0E3E5",
     "font_family": "Segoe UI",
     "font_size": 11,
 }
@@ -764,8 +764,8 @@ class Overlay(QWidget):
             "QLabel {"
             f"  color: {cfg['text_color']};"
             f"  background-color: rgba({rgba});"
-            "  border: 1px solid #2A2F38;"
-            "  border-radius: 8px;"
+            "  border: 1px solid rgba(255, 255, 255, 28);"
+            "  border-radius: 4px;"
             "  padding: 14px 16px 16px 16px;"
             "}"
         )
@@ -804,14 +804,17 @@ class Overlay(QWidget):
 
 # ---- Visual layer ----
 
-C_TEXT   = "#F2F4F7"  # primary
-C_DIM    = "#9098A4"  # secondary
-C_MUTED  = "#5A6270"  # tertiary
-C_FAINT  = "#3D434E"  # quaternary
-C_BLUE   = "#3B9EFF"
-C_ORANGE = "#FF7A29"
-C_WIN    = "#4ADE80"
-C_LOSS   = "#F87171"
+# Palette mapped from DESIGN(1).md — Material 3 tokens, "High-Octane Overlay".
+C_TEXT     = "#E0E3E5"  # on-surface
+C_DIM      = "#C4C9AC"  # on-surface-variant (warm)
+C_MUTED    = "#8E9379"  # outline
+C_FAINT    = "#444933"  # outline-variant (dividers, NEW pill border)
+C_BLUE     = "#3B9EFF"  # fallback only — wire ColorPrimary preferred
+C_ORANGE   = "#FF7A29"  # fallback only
+C_WIN      = "#C3F400"  # primary-container (lime) — wins, streaks, +diffs
+C_WIN_FG   = "#1A2300"  # text on lime pill
+C_LOSS     = "#FFB4AB"  # error
+C_LOSS_FG  = "#690005"  # text on error pill
 
 
 def idle_html(message: str) -> str:
@@ -864,7 +867,7 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
 
     if is_self:
         stat_cell = (
-            f"<span style='color:{C_DIM};font-size:8pt;font-weight:700;"
+            f"<span style='color:{C_WIN};font-size:8pt;font-weight:700;"
             "letter-spacing:0.16em;'>YOU</span>"
         )
         sub_row = ""
@@ -935,10 +938,12 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
 
 def _team_section(label: str, color: str, players: list, is_you: bool,
                   my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
-    bar_color = color if is_you else C_FAINT
+    # Both teams get their actual ColorPrimary from the wire — the YOU tag (lime)
+    # carries the "this is your team" hierarchy now, not the bar color.
+    bar_color = color
     label_color = C_TEXT if is_you else C_DIM
     you_tag = (
-        f"<span style='color:{color};font-size:8pt;font-weight:700;"
+        f"<span style='color:{C_WIN};font-size:8pt;font-weight:700;"
         "letter-spacing:0.16em;'>&nbsp;&nbsp;YOU</span>"
         if is_you else ""
     )
@@ -1163,10 +1168,17 @@ def render_session_html(s: SessionStats) -> str:
         else f"<span style='color:{C_MUTED};'>—</span>"
     )
 
+    pill_style = "font-weight:700;padding:1px 6px;border-radius:2px;"
     if s.win_streak >= 2:
-        streak_val = f"<span style='color:{C_WIN};font-weight:700;'>W{s.win_streak}</span>"
+        streak_val = (
+            f"<span style='background-color:{C_WIN};color:{C_WIN_FG};{pill_style}'>"
+            f"W{s.win_streak}</span>"
+        )
     elif s.loss_streak >= 2:
-        streak_val = f"<span style='color:{C_LOSS};font-weight:700;'>L{s.loss_streak}</span>"
+        streak_val = (
+            f"<span style='background-color:{C_LOSS};color:{C_LOSS_FG};{pill_style}'>"
+            f"L{s.loss_streak}</span>"
+        )
     else:
         streak_val = f"<span style='color:{C_MUTED};'>—</span>"
 
@@ -1225,7 +1237,11 @@ def render_session_html(s: SessionStats) -> str:
         _stat_row("Matches", matches_val),
         _stat_row("Goals", goals_val),
         _stat_row("Streak", streak_val),
-        _stat_row("Best run", f"W{s.best_win_streak}" if s.best_win_streak else em_dash),
+        _stat_row(
+            "Best run",
+            (f"<span style='background-color:{C_WIN};color:{C_WIN_FG};{pill_style}'>"
+             f"W{s.best_win_streak}</span>") if s.best_win_streak else em_dash,
+        ),
     ]
     play_rows = [
         _stat_row("Saves",     _pair_int_self(saves_s, saves_t)),
