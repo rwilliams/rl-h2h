@@ -33,6 +33,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 MATCHES_PATH = APP_DIR / "matches.jsonl"
 PLAYERS_PATH = APP_DIR / "players.json"
 MMR_CACHE_PATH = APP_DIR / "mmr_cache.json"
+MMR_LOG_PATH = APP_DIR / "mmr.log"
 
 
 EVT_MATCH_CREATED = "MatchCreated"
@@ -450,6 +451,30 @@ MMR_TIER_COLORS = {
 MMR_TTL_SECONDS = 600   # local cache freshness — TRN's own TTL is 4 min
 MMR_FETCH_INTERVAL = 2.0   # min seconds between outbound TRN requests
 
+# Cap log size at ~256 KB so it doesn't grow forever in long-running sessions.
+# We rotate by truncating once we cross the cap — last write wins, no archive.
+_MMR_LOG_CAP = 256 * 1024
+_mmr_log_lock = threading.Lock()
+
+
+def mmr_log(msg: str) -> None:
+    """Append a timestamped line to mmr.log AND mirror to stderr.
+
+    Designed to work even under start.bat's `pythonw` launch (which discards
+    stdout/stderr) — the log file is the sole source of truth for debugging.
+    Failures writing the log are swallowed: a debug log breaking the app is
+    a worse outcome than missing one log line."""
+    line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(f"[mmr] {msg}", file=sys.stderr)
+    try:
+        with _mmr_log_lock:
+            if MMR_LOG_PATH.exists() and MMR_LOG_PATH.stat().st_size > _MMR_LOG_CAP:
+                MMR_LOG_PATH.write_text("", encoding="utf-8")
+            with MMR_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError:
+        pass
+
 
 def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
     """(trn_platform_slug, display_name) for a wire identity, or None if
@@ -583,21 +608,27 @@ class MMRClient(QObject):
         try:
             from curl_cffi import requests as _curl_requests  # noqa
             self._requests = _curl_requests
-        except ImportError:
+            mmr_log(f"init enabled={self._enabled} ttl={self._ttl}s "
+                    f"cache_entries={len(self._cache)} curl_cffi=ok")
+        except ImportError as e:
             self._requests = None
-            if self._enabled:
-                print("[mmr] curl_cffi not installed; MMR fetch disabled. "
-                      "Run: pip install curl_cffi", file=sys.stderr)
+            mmr_log(f"init curl_cffi MISSING ({e}). Run: "
+                    f"python -m pip install -r requirements.txt")
 
     def start(self) -> None:
         if not self._thread.is_alive():
             self._thread.start()
+            mmr_log("worker thread started")
 
     def stop(self) -> None:
         self._stop.set()
 
     def set_enabled(self, on: bool) -> None:
+        prev = self._enabled
         self._enabled = bool(on)
+        if prev != self._enabled:
+            mmr_log(f"set_enabled {prev} -> {self._enabled} "
+                    f"(curl_cffi_loaded={self._requests is not None})")
 
     def is_enabled(self) -> bool:
         return self._enabled and self._requests is not None
@@ -623,27 +654,40 @@ class MMRClient(QObject):
     def enqueue(self, primary_id: str, name: str) -> None:
         """Queue a refresh for this opponent. Skips if disabled, already
         in-flight, or cache is fresh enough."""
-        if not self.is_enabled():
-            return
         key = player_key(primary_id)
+        if not self._enabled:
+            mmr_log(f"enqueue skip {key!r} ({name!r}): disabled")
+            return
+        if self._requests is None:
+            mmr_log(f"enqueue skip {key!r} ({name!r}): curl_cffi missing")
+            return
         if key in self._inflight:
+            mmr_log(f"enqueue skip {key!r} ({name!r}): already in-flight")
             return
         with self._cache_lock:
             entry = self._cache.get(key)
         if not self._is_stale(entry):
+            mmr_log(f"enqueue skip {key!r} ({name!r}): cache fresh "
+                    f"(fetched_at={entry.get('fetched_at')!r})")
             return
         handle = mmr_lookup_handle(primary_id, name)
         if handle is None:
+            mmr_log(f"enqueue skip {key!r} ({name!r}): unsupported platform "
+                    f"or missing name")
             return
         plat, ident = handle
         self._inflight.add(key)
         self._queue.put((key, plat, ident))
+        mmr_log(f"enqueue {key!r} -> {plat}/{ident!r} (queue size={self._queue.qsize()})")
 
     def enqueue_roster(self, roster: list[dict]) -> None:
         """Convenience: queue every player in a match roster."""
+        mmr_log(f"enqueue_roster: {len(roster)} player(s) "
+                f"(enabled={self._enabled}, curl_cffi={self._requests is not None})")
         for p in roster:
             pid = p.get("primaryId") or p.get("key")
             if not pid:
+                mmr_log(f"  skip: no primaryId/key for {p.get('name')!r}")
                 continue
             self.enqueue(pid, p.get("name") or "")
 
@@ -657,24 +701,30 @@ class MMRClient(QObject):
             # Throttle global outbound rate.
             since = time.monotonic() - last_request
             if since < MMR_FETCH_INTERVAL:
-                self._stop.wait(MMR_FETCH_INTERVAL - since)
+                wait = MMR_FETCH_INTERVAL - since
+                mmr_log(f"throttle wait {wait:.2f}s before {key!r}")
+                self._stop.wait(wait)
                 if self._stop.is_set():
                     break
             try:
                 self._fetch_one(key, plat, ident)
             except Exception as e:
-                print(f"[mmr] {key} fetch failed: {type(e).__name__}: {e}",
-                      file=sys.stderr)
+                mmr_log(f"{key!r} fetch FAILED: {type(e).__name__}: {e}")
             finally:
                 self._inflight.discard(key)
             last_request = time.monotonic()
 
     def _fetch_one(self, key: str, plat: str, ident: str) -> None:
         if self._requests is None:
+            mmr_log(f"{key!r} fetch aborted: curl_cffi missing")
             return
         url = self._BASE_URL.format(plat=plat, ident=ident)
+        mmr_log(f"GET {url}")
+        t0 = time.monotonic()
         r = self._requests.get(url, headers=self._HEADERS,
                                impersonate="chrome120", timeout=15)
+        dt = (time.monotonic() - t0) * 1000
+        mmr_log(f"  -> HTTP {r.status_code} in {dt:.0f}ms ({len(r.content)} bytes)")
         if r.status_code == 404:
             # Player isn't on TRN under this handle. Cache a negative entry so
             # we don't keep hammering the same dead lookup every time the
@@ -686,24 +736,29 @@ class MMRClient(QObject):
                     "handle": ident,
                 }
                 save_mmr_cache(self._cache)
+            mmr_log(f"  {key!r} NOT FOUND (cached negative)")
             self.updated.emit(key)
             return
         if r.status_code != 200:
-            print(f"[mmr] {key} HTTP {r.status_code}: {r.text[:120]}",
-                  file=sys.stderr)
+            mmr_log(f"  {key!r} HTTP {r.status_code}: {r.text[:200]!r}")
             return
         try:
             payload = r.json()
         except ValueError as e:
-            print(f"[mmr] {key} bad JSON: {e}", file=sys.stderr)
+            mmr_log(f"  {key!r} bad JSON: {e}")
             return
         data = (payload or {}).get("data")
         if not isinstance(data, dict):
+            mmr_log(f"  {key!r} no .data in response")
             return
         entry = _parse_trn_payload(data)
         with self._cache_lock:
             self._cache[key] = entry
             save_mmr_cache(self._cache)
+        best = entry.get("best") or {}
+        mmr_log(f"  {key!r} OK handle={entry.get('handle')!r} "
+                f"playlists={list((entry.get('playlists') or {}).keys())} "
+                f"best={best.get('mmr')}@{best.get('playlist')}")
         self.updated.emit(key)
 
 
@@ -2281,11 +2336,27 @@ def main():
         """Re-run render_html against the saved roster — used both when a match
         starts and whenever fresh MMR data lands or the user cycles category."""
         if not state["roster"]:
+            mmr_log("rerender_h2h: skip (no roster)")
             return
         self_id = cfg.get("self_player_id")
         # Snapshot the cache once per render so all rows see a consistent view
         # even if the worker writes mid-build.
         mmr_db = {p["key"]: mmr_client.get(p["key"]) for p in state["roster"]}
+        if mmr_client.is_enabled():
+            summary_parts = []
+            for p in state["roster"]:
+                e = mmr_db.get(p["key"])
+                if e is None:
+                    summary_parts.append(f"{p['name']}=…")
+                elif e.get("not_found"):
+                    summary_parts.append(f"{p['name']}=NF")
+                else:
+                    best = (e.get("best") or {})
+                    summary_parts.append(
+                        f"{p['name']}={best.get('mmr')}@{best.get('playlist')}"
+                    )
+            mmr_log(f"rerender_h2h: cat={cfg.get('mmr_category','best')!r} "
+                    f"rows=[{', '.join(summary_parts)}]")
         state["h2h_html"] = render_html(
             state["roster"], state["my_team"], state["arena"],
             players_db, state["team_colors"], self_id,
@@ -2326,7 +2397,13 @@ def main():
         # instantly, fresh entries arrive over the next ~1s per opponent.
         if mmr_client.is_enabled():
             roster_for_mmr = [p for p in payload["players"] if p["key"] != self_id]
+            mmr_log(f"on_initialized: enqueueing {len(roster_for_mmr)} opponent(s) "
+                    f"(self_id={self_id!r})")
             mmr_client.enqueue_roster(roster_for_mmr)
+        else:
+            mmr_log(f"on_initialized: MMR disabled, skipping enqueue "
+                    f"(enabled_flag={cfg.get('mmr_enabled', False)}, "
+                    f"curl_cffi_loaded={mmr_client._requests is not None})")
         rerender_h2h()
         update_overlay()
         print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
@@ -2414,7 +2491,7 @@ def main():
         nxt = MMR_CATEGORIES[(i + 1) % len(MMR_CATEGORIES)]
         cfg["mmr_category"] = nxt
         save_config(cfg)
-        print(f"[mmr] category={nxt}", file=sys.stderr)
+        mmr_log(f"F10 cycle_category: {cur!r} -> {nxt!r}")
         rerender_h2h()
         update_overlay()
 
@@ -2516,13 +2593,16 @@ def main():
             cfg["mmr_enabled"] = bool(checked)
             save_config(cfg)
             mmr_client.set_enabled(bool(checked))
-            print(f"[mmr] enabled={cfg['mmr_enabled']}", file=sys.stderr)
+            mmr_log(f"tray toggle: enabled={cfg['mmr_enabled']} "
+                    f"in_match={state['in_match']} "
+                    f"roster_size={len(state.get('roster') or [])}")
             # Flipping ON in the middle of a match: enqueue the current roster
             # immediately so the user sees data without waiting for the next
             # match. Flipping OFF: just re-render so the chips disappear.
             if checked and state["in_match"] and state["roster"]:
                 self_id = cfg.get("self_player_id")
                 roster_for_mmr = [p for p in state["roster"] if p["key"] != self_id]
+                mmr_log(f"  in-match enqueue {len(roster_for_mmr)} opponent(s)")
                 mmr_client.enqueue_roster(roster_for_mmr)
             rerender_h2h()
             update_overlay()

@@ -155,7 +155,7 @@ The setting persists in `config.json` (`auto_update: true|false`). Launching wit
 - **Gamepad bindings silently ignored.** The `inputs` package needs to be installed (`pip install -r requirements.txt`). The console will say `[hotkey] gamepad listener watching: [...]` on startup if it's working.
 - **Port 49123 already in use.** Pick a different port in `DefaultStatsAPI.ini` *and* in `config.json` (`"port": 49123`) — they must match.
 - **MMR shows `—` for an opponent you can see in-game.** tracker.network indexes by display name. Console players who renamed recently, or who have a non-unique handle that collides with someone else, may not resolve. There is no way around this short of TRN updating their database. Epic players' MMR usually works because Epic display names are unique on the platform.
-- **MMR shows `…` and never resolves.** Either `curl_cffi` failed to install (re-run `pip install -r requirements.txt`) or `api.tracker.gg` is unreachable. Console output prefixes `[mmr]` will say which.
+- **MMR shows `…` and never resolves.** Either `curl_cffi` failed to install (re-run `pip install -r requirements.txt`) or `api.tracker.gg` is unreachable. Open `mmr.log` next to the script — every fetch, skip, and error gets logged there with timestamps. (`start.bat` uses `pythonw` which has no console window, so the log file is the source of truth.)
 
 ## License
 
