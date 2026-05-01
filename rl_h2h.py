@@ -804,17 +804,16 @@ class Overlay(QWidget):
 
 # ---- Visual layer ----
 
-# Palette mapped from DESIGN(1).md — Material 3 tokens, "High-Octane Overlay".
+# Palette mapped from DESIGN(1).md, restricted to primary/secondary/tertiary tokens
+# (no lime/gold primary-container — user pref).
 C_TEXT     = "#E0E3E5"  # on-surface
-C_DIM      = "#C4C9AC"  # on-surface-variant (warm)
+C_DIM      = "#C4C9AC"  # on-surface-variant
 C_MUTED    = "#8E9379"  # outline
 C_FAINT    = "#444933"  # outline-variant (dividers, NEW pill border)
 C_BLUE     = "#3B9EFF"  # fallback only — wire ColorPrimary preferred
 C_ORANGE   = "#FF7A29"  # fallback only
-C_WIN      = "#C3F400"  # primary-container (lime) — wins, streaks, +diffs
-C_WIN_FG   = "#1A2300"  # text on lime pill
-C_LOSS     = "#FFB4AB"  # error
-C_LOSS_FG  = "#690005"  # text on error pill
+C_WIN      = "#D7E3F8"  # tertiary-container — cool ice-blue accent
+C_LOSS     = "#BFC7D8"  # secondary — muted for de-emphasis
 
 
 def idle_html(message: str) -> str:
@@ -938,15 +937,10 @@ def _player_row(p: dict, my_team: int, players_db: dict, self_id: Optional[str] 
 
 def _team_section(label: str, color: str, players: list, is_you: bool,
                   my_team: int, players_db: dict, self_id: Optional[str] = None) -> str:
-    # Both teams get their actual ColorPrimary from the wire — the YOU tag (lime)
-    # carries the "this is your team" hierarchy now, not the bar color.
+    # Both teams get their actual ColorPrimary from the wire. The YOU tag lives on
+    # the player row (in _player_row), not duplicated on the section header.
     bar_color = color
     label_color = C_TEXT if is_you else C_DIM
-    you_tag = (
-        f"<span style='color:{C_WIN};font-size:8pt;font-weight:700;"
-        "letter-spacing:0.16em;'>&nbsp;&nbsp;YOU</span>"
-        if is_you else ""
-    )
 
     header = (
         "<table width='100%' cellspacing='0' cellpadding='0' "
@@ -955,7 +949,7 @@ def _team_section(label: str, color: str, players: list, is_you: bool,
         f"<td width='3' bgcolor='{bar_color}' style='font-size:1px;line-height:1px;'>&nbsp;</td>"
         "<td width='8' style='font-size:1px;'>&nbsp;</td>"
         f"<td align='left' style='color:{label_color};font-size:9pt;font-weight:700;"
-        f"letter-spacing:0.18em;'>{label}{you_tag}</td>"
+        f"letter-spacing:0.18em;'>{label}</td>"
         "</tr>"
         "</table>"
     )
@@ -1157,7 +1151,7 @@ def render_session_html(s: SessionStats) -> str:
     elapsed = int((datetime.now(timezone.utc) - s.started_at).total_seconds())
     h, rem = divmod(elapsed, 3600)
     m = rem // 60
-    duration = f"{h}h {m:02d}m" if h else f"{m}m"
+    duration = f"{h}h {m:02d}m" if h else f"{m} min"
 
     win_pct = (s.wins / s.matches * 100.0) if s.matches else 0.0
     matches_val = (
@@ -1168,17 +1162,10 @@ def render_session_html(s: SessionStats) -> str:
         else f"<span style='color:{C_MUTED};'>—</span>"
     )
 
-    pill_style = "font-weight:700;padding:1px 6px;border-radius:2px;"
     if s.win_streak >= 2:
-        streak_val = (
-            f"<span style='background-color:{C_WIN};color:{C_WIN_FG};{pill_style}'>"
-            f"W{s.win_streak}</span>"
-        )
+        streak_val = f"<span style='color:{C_WIN};font-weight:700;'>W{s.win_streak}</span>"
     elif s.loss_streak >= 2:
-        streak_val = (
-            f"<span style='background-color:{C_LOSS};color:{C_LOSS_FG};{pill_style}'>"
-            f"L{s.loss_streak}</span>"
-        )
+        streak_val = f"<span style='color:{C_LOSS};font-weight:700;'>L{s.loss_streak}</span>"
     else:
         streak_val = f"<span style='color:{C_MUTED};'>—</span>"
 
@@ -1239,8 +1226,8 @@ def render_session_html(s: SessionStats) -> str:
         _stat_row("Streak", streak_val),
         _stat_row(
             "Best run",
-            (f"<span style='background-color:{C_WIN};color:{C_WIN_FG};{pill_style}'>"
-             f"W{s.best_win_streak}</span>") if s.best_win_streak else em_dash,
+            (f"<span style='color:{C_WIN};font-weight:700;'>W{s.best_win_streak}</span>"
+             if s.best_win_streak else em_dash),
         ),
     ]
     play_rows = [
