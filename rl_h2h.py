@@ -509,6 +509,11 @@ class StatsClient(QObject):
         # score went up — that's how we infer own-goals. All other events emit
         # immediately so consumers see them in real time.
         if event == EVT_GOAL_SCORED:
+            scorer = data.get("Scorer") if isinstance(data.get("Scorer"), dict) else {}
+            print(f"[goal] queued: scorer={scorer.get('Name')!r} "
+                  f"scorer_team={scorer.get('TeamNum')} "
+                  f"snapshot_score={list(self._score)} "
+                  f"my_team={self._my_team}", file=sys.stderr)
             self._pending_goals.append((data, list(self._score)))
         elif event:
             self.event_seen.emit(event, data)
@@ -529,7 +534,7 @@ class StatsClient(QObject):
         elif event == EVT_MATCH_ENDED:
             self._on_match_ended(data)
         elif event == EVT_MATCH_DESTROYED:
-            self._drain_pending_goals()
+            self._drain_pending_goals(why="match_destroyed")
             self.match_destroyed.emit()
             self._reset()
         elif event == EVT_REPLAY_CREATED:
@@ -553,6 +558,11 @@ class StatsClient(QObject):
                         continue
                     sc = t.get("Score")
                     if isinstance(sc, int):
+                        prev = self._score[int(tn)]
+                        if sc != prev:
+                            print(f"[goal] score change: team {int(tn)} "
+                                  f"{prev}→{sc} (full={[*self._score[:int(tn)], sc, *self._score[int(tn)+1:]]})",
+                                  file=sys.stderr)
                         self._score[int(tn)] = sc
                     # Skip color capture once both teams' colors are known.
                     if len(self._team_colors) < 2:
@@ -562,7 +572,7 @@ class StatsClient(QObject):
                             self._team_colors[int(tn)] = "#" + cp.upper()
         # Now that the score reflects this tick, attribute any GoalScored events
         # that were waiting for a score-delta to confirm own-goal vs normal.
-        self._drain_pending_goals()
+        self._drain_pending_goals(why="update_state")
         # Once the round has actually started (kickoff fired), the roster is locked.
         # Until then we keep accumulating — players load asynchronously in 2v2/3v3.
         if self._round_started:
@@ -609,7 +619,7 @@ class StatsClient(QObject):
             return
         # Drain before MatchEnded fires — once `state["in_match"]` flips to False,
         # SessionStats stops processing events, so any pending goals would be lost.
-        self._drain_pending_goals()
+        self._drain_pending_goals(why="match_ended")
         winner = data.get("WinnerTeamNum")
         if winner is None or self._my_team is None or not self._roster:
             return
@@ -623,7 +633,7 @@ class StatsClient(QObject):
             "teamColors": dict(self._team_colors),
         })
 
-    def _drain_pending_goals(self) -> None:
+    def _drain_pending_goals(self, why: str = "tick") -> None:
         """Resolve queued GoalScored events whose own-goal status is now visible.
 
         Compares each entry's score snapshot to the current score. Whichever
@@ -642,20 +652,35 @@ class StatsClient(QObject):
             scorer_team = scorer.get("TeamNum") if isinstance(scorer, dict) else None
             if scorer_team not in (0, 1):
                 data["bOwnGoal"] = False
+                print(f"[goal] drain ({why}): malformed scorer_team={scorer_team!r}; "
+                      f"emitting bOwnGoal=False", file=sys.stderr)
                 self.event_seen.emit(EVT_GOAL_SCORED, data)
                 continue
             d_scorer = current[scorer_team] - snapshot[scorer_team]
             d_other = current[1 - scorer_team] - snapshot[1 - scorer_team]
             if d_scorer > 0 and d_other == 0:
                 data["bOwnGoal"] = False
+                print(f"[goal] drain ({why}): NORMAL scorer={scorer.get('Name')!r} "
+                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
+                      f"d_scorer={d_scorer} d_other={d_other}", file=sys.stderr)
                 self.event_seen.emit(EVT_GOAL_SCORED, data)
             elif d_other > 0 and d_scorer == 0:
                 data["bOwnGoal"] = True
+                print(f"[goal] drain ({why}): OWN-GOAL scorer={scorer.get('Name')!r} "
+                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
+                      f"d_scorer={d_scorer} d_other={d_other}", file=sys.stderr)
                 self.event_seen.emit(EVT_GOAL_SCORED, data)
             elif d_scorer == 0 and d_other == 0:
+                print(f"[goal] drain ({why}): DEFER scorer={scorer.get('Name')!r} "
+                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
+                      f"(no delta yet)", file=sys.stderr)
                 remaining.append((data, snapshot))
             else:
                 data["bOwnGoal"] = False
+                print(f"[goal] drain ({why}): AMBIGUOUS scorer={scorer.get('Name')!r} "
+                      f"team={scorer_team} snap={snapshot} cur={list(current)} "
+                      f"d_scorer={d_scorer} d_other={d_other}; "
+                      f"defaulting bOwnGoal=False", file=sys.stderr)
                 self.event_seen.emit(EVT_GOAL_SCORED, data)
         self._pending_goals = remaining
 
