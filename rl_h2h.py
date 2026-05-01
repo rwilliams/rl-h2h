@@ -761,9 +761,16 @@ class MMRClient(QObject):
             self._cache[key] = entry
             save_mmr_cache(self._cache)
         best = entry.get("best") or {}
-        mmr_log(f"  {key!r} OK handle={entry.get('handle')!r} "
-                f"playlists={list((entry.get('playlists') or {}).keys())} "
-                f"best={best.get('mmr')}@{best.get('playlist')}")
+        # Compact one-liner with every playlist's MMR — saves cross-referencing
+        # mmr.log and my_mmr.log when debugging "did the number actually move?"
+        pl = entry.get("playlists") or {}
+        pl_str = " ".join(
+            f"{lbl}={(pl.get(lbl) or {}).get('mmr', '—')}"
+            for lbl in ("1v1", "2v2", "3v3")
+        )
+        mmr_log(f"  {key!r} OK handle={entry.get('handle')!r} {pl_str} "
+                f"best={best.get('mmr')}@{best.get('playlist')} "
+                f"trn_lastUpdated={entry.get('lastUpdated')}")
         self.updated.emit(key)
 
 
@@ -2531,26 +2538,35 @@ def main():
 
     hotkey_cycle.pressed.connect(cycle_mmr_category)
 
-    # Tracks the last self entry we logged, so we can compute deltas without
-    # re-reading my_mmr.log on every refresh. Seeded with whatever's in cache
-    # at startup so the first post-restart entry shows a delta from the
-    # previous session's last value.
-    last_self_log = {"playlists": {}}
+    # Tracks the last self entry we logged so we can compute deltas (and skip
+    # writes when nothing has changed). Seeded from disk cache below.
+    last_self_log = {"playlists": {}, "lastUpdated": None}
 
     def _log_my_mmr(entry: dict):
-        """Append one line per refresh to my_mmr.log with the per-playlist MMR
-        and the delta vs. the previous entry. Lets you eyeball whether MMR
-        moves between matches in real time."""
+        """Append one line per *meaningful* refresh to my_mmr.log: per-playlist
+        MMR, deltas, and TRN's lastUpdated. Skips the write when no playlist
+        moved AND TRN's snapshot hasn't rolled — those entries were just our
+        force-refreshes hitting TRN's static edge cache and add no signal."""
         prev = last_self_log["playlists"]
         cur = entry.get("playlists") or {}
+        last_updated = entry.get("lastUpdated") or "?"
+
+        any_change = any(
+            (cur.get(lbl) or {}).get("mmr") != (prev.get(lbl) or {}).get("mmr")
+            for lbl in ("1v1", "2v2", "3v3")
+        )
+        trn_rolled = last_updated != last_self_log["lastUpdated"]
+        first_entry = not last_self_log["lastUpdated"]
+        if not (any_change or trn_rolled or first_entry):
+            return  # static cache hit; saying so over and over is just noise
+
         parts = []
         for label in ("1v1", "2v2", "3v3"):
-            cv = cur.get(label, {}).get("mmr")
-            pv = prev.get(label, {}).get("mmr")
+            cv = (cur.get(label) or {}).get("mmr")
+            pv = (prev.get(label) or {}).get("mmr")
             if cv is None:
                 parts.append(f"{label}=—")
-                continue
-            if pv is None:
+            elif pv is None:
                 parts.append(f"{label}={cv}")
             elif cv == pv:
                 parts.append(f"{label}={cv} (·)")
@@ -2561,7 +2577,6 @@ def main():
             f"best={best.get('mmr')}@{best.get('playlist')}"
             if best else "best=—"
         )
-        last_updated = entry.get("lastUpdated") or "?"
         line = (
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
             f"{'  '.join(parts)}  {best_part}  "
@@ -2573,15 +2588,19 @@ def main():
         except OSError as e:
             mmr_log(f"my_mmr.log write failed: {e}")
         last_self_log["playlists"] = cur
+        last_self_log["lastUpdated"] = last_updated
 
-    # Seed last_self_log from disk cache so deltas span restarts.
+    # Seed last_self_log from disk cache so deltas span restarts AND so the
+    # first refresh after launch doesn't write a noise line if nothing moved.
     self_id = cfg.get("self_player_id")
     if self_id:
         existing_self = mmr_client.get(self_id)
         if existing_self and not existing_self.get("not_found"):
             last_self_log["playlists"] = existing_self.get("playlists") or {}
+            last_self_log["lastUpdated"] = existing_self.get("lastUpdated")
             mmr_log(f"seed last_self_log from cache: "
-                    f"{list(last_self_log['playlists'].keys())}")
+                    f"{list(last_self_log['playlists'].keys())} "
+                    f"trn_lastUpdated={last_self_log['lastUpdated']}")
 
     def on_mmr_updated(key: str):
         # Self MMR refresh? Mirror the snapshot to my_mmr.log for tracking.
