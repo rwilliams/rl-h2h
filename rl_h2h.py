@@ -22,7 +22,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout, QWidget
 from pynput import keyboard
 
 
@@ -1015,8 +1015,12 @@ class SessionStats:
     """Aggregates stats from script start until kill. Updated from StatsClient signals."""
 
     def __init__(self):
-        self.started_at = datetime.now(timezone.utc)
         self.self_name: Optional[str] = None
+        self.reset()
+
+    def reset(self) -> None:
+        # Identity (self_name) is preserved across resets; counters start fresh.
+        self.started_at = datetime.now(timezone.utc)
         self.matches = 0
         self.wins = 0
         self.losses = 0
@@ -1626,6 +1630,38 @@ def main():
                 print(f"[tray] open folder failed: {e}", file=sys.stderr)
         open_action.triggered.connect(_open_folder)
         menu.addAction(open_action)
+
+        reset_session_action = QAction("Reset session stats")
+        def _reset_session():
+            session.reset()
+            match_stats.reset(self_name=session.self_name)
+            print("[reset] session stats cleared", file=sys.stderr)
+            update_overlay()
+        reset_session_action.triggered.connect(_reset_session)
+        menu.addAction(reset_session_action)
+
+        wipe_history_action = QAction("Wipe match history…")
+        def _wipe_history():
+            reply = QMessageBox.question(
+                None,
+                "Wipe match history",
+                "Permanently delete matches.jsonl and players.json?\n"
+                "Your current session stats are kept.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            for path in (MATCHES_PATH, PLAYERS_PATH):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    print(f"[reset] failed to delete {path.name}: {e}", file=sys.stderr)
+            players_db.clear()
+            print("[reset] match history wiped", file=sys.stderr)
+            update_overlay()
+        wipe_history_action.triggered.connect(_wipe_history)
+        menu.addAction(wipe_history_action)
         menu.addSeparator()
 
         quit_action = QAction("Quit")
