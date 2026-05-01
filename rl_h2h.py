@@ -1595,14 +1595,12 @@ def main():
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
                 # Qt RichText doesn't reliably honor `height` on `<div>` (block size
-                # follows content), so use a `<table><td height='N'>` which it does honor.
+                # follows content) and `bgcolor` cells ignore `height='1'` (clamped to a
+                # ~12px minimum, which paints an ugly olive bar). A single empty cell at
+                # the desired pixel height is the only thing that renders cleanly.
                 spacer = (
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
-                    "<tr><td height='14'>&nbsp;</td></tr></table>"
-                    f"<table cellpadding='0' cellspacing='0' width='100%' bgcolor='{C_FAINT}'>"
-                    "<tr><td height='1'></td></tr></table>"
-                    "<table cellpadding='0' cellspacing='0' width='100%'>"
-                    "<tr><td height='14'>&nbsp;</td></tr></table>"
+                    "<tr><td height='28'>&nbsp;</td></tr></table>"
                 )
                 overlay.set_html(state["h2h_html"] + spacer + render_session_html(session))
             else:
