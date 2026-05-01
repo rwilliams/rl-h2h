@@ -222,9 +222,10 @@ class StatsClient(QObject):
             print("[stats] connected (websocket)", file=sys.stderr)
             async for raw in ws:
                 try:
-                    self._handle(json.loads(raw))
+                    msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                self._safe_handle(msg)
 
     async def _run_tcp(self):
         reader, writer = await asyncio.open_connection(self.host, self.port)
@@ -249,13 +250,21 @@ class StatsClient(QObject):
                         buf = stripped
                         break
                     buf = stripped[idx:]
-                    self._handle(obj)
+                    self._safe_handle(obj)
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    def _safe_handle(self, msg) -> None:
+        if not isinstance(msg, dict):
+            return
+        try:
+            self._handle(msg)
+        except Exception as e:
+            print(f"[stats] handler error on {msg.get('Event', '?')}: {e}", file=sys.stderr)
 
     def _handle(self, msg: dict):
         event = msg.get("Event")
