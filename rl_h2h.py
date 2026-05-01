@@ -156,8 +156,7 @@ class StatsClient(QObject):
         self._arena: str = ""
         self._match_guid: Optional[str] = None
         self._initialized_emitted = False
-        # Diagnostic: dump first N decoded messages so we can see the real wire format.
-        self._sample_remaining = getattr(self, "_sample_remaining", 5)
+        self._sample_remaining = getattr(self, "_sample_remaining", 2)
 
     def start(self):
         self._thread.start()
@@ -277,7 +276,16 @@ class StatsClient(QObject):
 
     def _handle(self, msg: dict):
         event = msg.get("Event")
-        data = msg.get("Data") or {}
+        # Wire format double-encodes: Data arrives as a JSON-encoded string, not a nested
+        # object as the published doc suggests. Decode the inner payload here.
+        data = msg.get("Data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data) if data else {}
+            except json.JSONDecodeError:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
         if event == EVT_UPDATE_STATE:
             self._on_update_state(data)
         elif event == EVT_MATCH_CREATED:
