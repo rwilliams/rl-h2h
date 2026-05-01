@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from ctypes import wintypes
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +35,7 @@ PLAYERS_PATH = APP_DIR / "players.json"
 MMR_CACHE_PATH = APP_DIR / "mmr_cache.json"
 MMR_LOG_PATH = APP_DIR / "mmr.log"
 MY_MMR_LOG_PATH = APP_DIR / "my_mmr.log"
+MMR_HISTORY_PATH = APP_DIR / "mmr_history.jsonl"
 
 
 EVT_MATCH_CREATED = "MatchCreated"
@@ -191,6 +192,18 @@ DEFAULT_CONFIG = {
         "                       (other platforms) to tracker.network. Toggle via the tray menu.",
         "mmr_category:          which playlist's MMR to show: 'best' | '1v1' | '2v2' | '3v3'.",
         "                       Cycle live with the cycle_hotkeys key.",
+        "graph_playlist_hotkeys: press to cycle the playlist shown in the graph view",
+        "                       (1v1 -> 2v2 -> 3v3 -> 1v1). Only active while F12 is held",
+        "                       and the session card is in graph mode.",
+        "session_view:          which sub-view F12 shows: 'session' (stats card) | 'graph'",
+        "                       (your MMR over time). Toggle with the expand_hotkeys key",
+        "                       while F12 is held.",
+        "graph_playlist:        which playlist the graph plots: '1v1' | '2v2' | '3v3'.",
+        "graph_match_window:    how many recent matches to plot in the graph view.",
+        "graph_match_grace_seconds: tolerance when joining matches to MMR snapshots —",
+        "                       Psyonix->TRN propagation can lag behind a match's end",
+        "                       by a minute or two; this grace catches matches that",
+        "                       ended just before a snapshot rolled.",
         "auto_update:           when true, start.bat checks GitHub for a newer version and",
         "                       updates silently before launching the app. Off by default;",
         "                       enable via the tray menu (right-click the H icon).",
@@ -210,9 +223,14 @@ DEFAULT_CONFIG = {
     "session_hotkeys": ["f12"],
     "expand_hotkeys": ["f11"],
     "cycle_hotkeys": ["f10"],
+    "graph_playlist_hotkeys": ["f9"],
     "h2h_default_expanded": False,
     "mmr_enabled": False,
     "mmr_category": "best",
+    "session_view": "session",
+    "graph_playlist": "2v2",
+    "graph_match_window": 30,
+    "graph_match_grace_seconds": 120,
     "auto_update": False,
     "require_rl_focus": True,
     "show_match_summary": True,
@@ -357,6 +375,77 @@ def save_players(players: dict) -> None:
 def append_match(record: dict) -> None:
     with MATCHES_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+
+
+_PLAYLIST_BY_PLAYER_COUNT = {2: "1v1", 4: "2v2", 6: "3v3"}
+
+
+def _playlist_from_player_count(n: int) -> str:
+    return _PLAYLIST_BY_PLAYER_COUNT.get(n, "other")
+
+
+def _match_playlist(record: dict) -> str:
+    """Field-or-derive: prefer the explicit playlist key, fall back to roster
+    size for matches saved before that field existed. Every consumer should
+    go through this — the raw record key is unreliable for legacy entries."""
+    pl = record.get("playlist")
+    if isinstance(pl, str) and pl:
+        return pl
+    players = record.get("players") or []
+    return _playlist_from_player_count(len(players))
+
+
+def append_mmr_history(entry: dict) -> None:
+    """One JSON line per snapshot of self MMR. Append-only; readers parse the
+    whole file (it grows ~80 bytes per line, well under 10 MB even for heavy
+    multi-year users). Caller is responsible for the dedupe rule (we write
+    only when TRN's lastUpdated has actually advanced)."""
+    try:
+        with MMR_HISTORY_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        print(f"[mmr-history] write failed: {e}", file=sys.stderr)
+
+
+def load_mmr_history() -> list[dict]:
+    """Parse mmr_history.jsonl into a list, in file order. Skips malformed
+    lines silently — one bad line shouldn't blank the whole graph."""
+    if not MMR_HISTORY_PATH.exists():
+        return []
+    out = []
+    try:
+        with MMR_HISTORY_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as e:
+        print(f"[mmr-history] read failed: {e}", file=sys.stderr)
+    return out
+
+
+def load_matches() -> list[dict]:
+    """Parse matches.jsonl. Same forgiveness as load_mmr_history."""
+    if not MATCHES_PATH.exists():
+        return []
+    out = []
+    try:
+        with MATCHES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as e:
+        print(f"[matches] read failed: {e}", file=sys.stderr)
+    return out
 
 
 def update_players_cache(players: dict, match: dict) -> None:
@@ -1232,6 +1321,16 @@ class Overlay(QWidget):
         self.adjustSize()
         self._reposition()
 
+    def set_pixmap(self, pix) -> None:
+        """Switches the QLabel from HTML mode to image mode. QLabel handles
+        the mode flip internally; the next call to set_html() switches back
+        cleanly. Used by the graph view, which can't be expressed in Qt's
+        RichText engine (no SVG, no data-URL <img>)."""
+        self._label.setPixmap(pix)
+        self._label.adjustSize()
+        self.adjustSize()
+        self._reposition()
+
     def _reposition(self):
         screen_obj = QGuiApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         screen = screen_obj.availableGeometry()
@@ -2066,6 +2165,28 @@ def _session_has_split(s: SessionStats) -> bool:
     )
 
 
+def _session_footer_html(cfg: dict, view: str) -> str:
+    """Hotkey hint row for the session card. View-specific copy: the session
+    view advertises F11 to swap to graph; the graph view doesn't reach here
+    because it's painted onto a pixmap, not HTML."""
+    expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
+    if view != "session" or not expand_label:
+        return ""
+    return (
+        "<table cellpadding='0' cellspacing='0' width='100%'>"
+        "<tr><td height='10'>&nbsp;</td></tr></table>"
+        "<table width='100%' cellspacing='0' cellpadding='0' "
+        "style='border-collapse:collapse;'>"
+        "<tr>"
+        f"<td align='left' style='color:{C_MUTED};font-size:8pt;"
+        f"letter-spacing:0.02em;padding:1px 0;'><b>{expand_label}</b> graph</td>"
+        f"<td align='right' style='color:{C_MUTED};font-size:8pt;"
+        f"letter-spacing:0.02em;padding:1px 0;'>session</td>"
+        "</tr>"
+        "</table>"
+    )
+
+
 def _h2h_footer_html(cfg: dict, expanded: bool, session: Optional[SessionStats]) -> str:
     """Single-table footer for the H2H overlay.
 
@@ -2230,6 +2351,329 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
     return header
 
 
+# ---- MMR graph view ---------------------------------------------------------
+# Renders an evolution graph of the user's own MMR for one playlist into a
+# QPixmap (Qt RichText doesn't support data-URL <img>, so we paint directly
+# and feed the pixmap to QLabel.setPixmap). Per-game attribution is derived
+# from cumulative TRN snapshots — see attribute_mmr_points() for the math.
+
+# Tier MMR ranges (RL Season 36 ranges, approximate). Anything below the
+# bottom is Bronze; anything above the top is SSL.
+MMR_RANK_ZONES = [
+    (0,    195,  "Bronze",            "#B87333"),
+    (195,  395,  "Silver",             "#C0C5CD"),
+    (395,  595,  "Gold",               "#F0C674"),
+    (595,  795,  "Platinum",           "#6FC8D6"),
+    (795,  995,  "Diamond",            "#7FA9F2"),
+    (995,  1195, "Champion",           "#B59CEE"),
+    (1195, 1565, "Grand Champion",     "#EC4F50"),
+    (1565, 2500, "Supersonic Legend",  "#DB2C70"),
+]
+
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def attribute_mmr_points(playlist: str, snapshots: list[dict],
+                         matches: list[dict],
+                         grace_seconds: int = 120,
+                         window: int = 30) -> list[dict]:
+    """Walk consecutive snapshot pairs and attribute the cumulative MMR delta
+    in each interval to the matches that ended within it.
+
+    Per-game step is *derived* from the data:
+      - When W != L:  step = abs(D) / abs(W - L)  (signed by outcome)
+      - When W == L:  use the rolling median of past intervals' steps; if no
+                      such history exists yet, bootstrap to 10
+      - When W + L == 0:  the user played outside our session — plot the
+                          snapshot transition as a single "snap" point and
+                          move on, no per-game attribution
+
+    Output: list of {"x": iso_ts, "mmr": int, "marker": "W"|"L"|"snap"} in
+    chronological order, capped to the last `window` items.
+    """
+    points: list[dict] = []
+    if not snapshots:
+        return points
+    # Filter snapshots that have data for this playlist; we anchor on the
+    # first one and walk from there.
+    relevant_snaps = [s for s in snapshots if (s.get("playlists") or {}).get(playlist) is not None]
+    if not relevant_snaps:
+        return points
+
+    pl_matches_sorted = sorted(
+        [m for m in matches if _match_playlist(m) == playlist
+         and isinstance(m.get("endedAt"), str)],
+        key=lambda m: m["endedAt"],
+    )
+
+    s0 = relevant_snaps[0]
+    cumulative = (s0.get("playlists") or {}).get(playlist)
+    points.append({"x": s0.get("ts"), "mmr": cumulative, "marker": "snap"})
+
+    past_steps: list[float] = []
+    grace = grace_seconds
+
+    for s_prev, s_cur in zip(relevant_snaps, relevant_snaps[1:]):
+        mmr_prev = (s_prev.get("playlists") or {}).get(playlist)
+        mmr_cur = (s_cur.get("playlists") or {}).get(playlist)
+        if mmr_prev is None or mmr_cur is None:
+            cumulative = mmr_cur if mmr_cur is not None else cumulative
+            points.append({"x": s_cur.get("ts"), "mmr": cumulative, "marker": "snap"})
+            continue
+        delta = mmr_cur - mmr_prev
+
+        t_prev = _parse_iso(s_prev.get("ts"))
+        t_cur = _parse_iso(s_cur.get("ts"))
+        if t_prev is None or t_cur is None:
+            cumulative = mmr_cur
+            points.append({"x": s_cur.get("ts"), "mmr": cumulative, "marker": "snap"})
+            continue
+        # Grace tail: a match that ended a few seconds before the snapshot's
+        # timestamp would otherwise be missed if our wall clock and TRN's
+        # clock skew, or if Psyonix→TRN propagation is slower than our poll.
+        cutoff = t_cur + timedelta(seconds=grace)
+        interval_matches = []
+        for m in pl_matches_sorted:
+            t_m = _parse_iso(m.get("endedAt"))
+            if t_m is None:
+                continue
+            if t_prev <= t_m <= cutoff:
+                interval_matches.append(m)
+
+        if not interval_matches:
+            # MMR moved without a recorded match — user played in another
+            # session or outside our tracking. Plot the snapshot transition
+            # only; no per-game line.
+            cumulative = mmr_cur
+            points.append({"x": s_cur.get("ts"), "mmr": cumulative, "marker": "snap"})
+            continue
+
+        wins = sum(1 for m in interval_matches if m.get("result") == "W")
+        losses = len(interval_matches) - wins
+
+        if wins != losses:
+            step = abs(delta) / abs(wins - losses)
+            past_steps.append(step)
+        else:
+            # No signal in this interval (net-zero). Use the median of
+            # previous derived steps; bootstrap to 10 only if we have nothing.
+            if past_steps:
+                sorted_steps = sorted(past_steps)
+                step = sorted_steps[len(sorted_steps) // 2]
+            else:
+                step = 10.0
+
+        for m in interval_matches:
+            sign = 1 if m.get("result") == "W" else -1
+            cumulative = cumulative + sign * step
+            points.append({
+                "x": m.get("endedAt"),
+                "mmr": int(round(cumulative)),
+                "marker": m.get("result") or "snap",
+            })
+
+        # Reconcile rounding/W==L mismatches by snapping the last point in
+        # this interval to the actually-observed MMR. Keeps the line on
+        # truth at every snapshot boundary.
+        if points[-1]["mmr"] != mmr_cur:
+            points[-1] = {**points[-1], "mmr": mmr_cur}
+        cumulative = mmr_cur
+
+    return points[-window:] if window > 0 else points
+
+
+def render_graph_pixmap(playlist: str, snapshots: list[dict],
+                        matches: list[dict], cfg: dict,
+                        canvas_width: int = 348, canvas_height: int = 220) -> "QPixmap":
+    """Paint the MMR-evolution graph for `playlist` onto a fresh QPixmap.
+
+    Header (~24px), plot region (~140px) with rank-zone backdrop + polyline
+    + W/L markers, footer (~30px) with hotkey hints + active playlist label.
+    Returns a QPixmap caller writes into the overlay via `set_pixmap`.
+    """
+    from PySide6.QtGui import QBrush, QColor, QPolygon, QPen
+    from PySide6.QtCore import QPoint
+
+    grace = int(cfg.get("graph_match_grace_seconds", 120))
+    window = int(cfg.get("graph_match_window", 30))
+    points = attribute_mmr_points(playlist, snapshots, matches,
+                                  grace_seconds=grace, window=window)
+
+    pix = QPixmap(canvas_width, canvas_height)
+    pix.fill(QColor(0, 0, 0, 0))  # transparent — QLabel stylesheet shows through
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.TextAntialiasing, True)
+
+    font_family = cfg.get("font_family", "Segoe UI")
+    title_font = QFont(font_family, 9, QFont.Bold)
+    body_font = QFont(font_family, 8)
+    small_font = QFont(font_family, 7)
+
+    HEADER_H = 26
+    FOOTER_H = 32
+    plot_top = HEADER_H
+    plot_bottom = canvas_height - FOOTER_H
+    plot_left = 4
+    plot_right = canvas_width - 4
+    plot_w = plot_right - plot_left
+    plot_h = plot_bottom - plot_top
+
+    # ---- Header ----
+    painter.setFont(title_font)
+    painter.setPen(QColor(C_TEXT))
+    painter.drawText(plot_left, HEADER_H - 8,
+                     f"MMR · {playlist.upper()}")
+
+    cycle_label = _first_keyboard_label(cfg.get("graph_playlist_hotkeys") or [])
+    expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
+
+    if len(points) < 2:
+        # Empty / insufficient data placeholder. Still draw the footer so
+        # users see the hotkey hints.
+        painter.setFont(body_font)
+        painter.setPen(QColor(C_MUTED))
+        msg = "Need at least 2 MMR snapshots — keep playing"
+        if not snapshots:
+            msg = "MMR not tracked yet — enable in tray menu and play a match"
+        elif not any((s.get("playlists") or {}).get(playlist) is not None
+                     for s in snapshots):
+            msg = f"No {playlist} MMR yet — play a ranked {playlist} match"
+        rect = painter.fontMetrics().boundingRect(msg)
+        painter.drawText(
+            plot_left + (plot_w - rect.width()) // 2,
+            plot_top + plot_h // 2,
+            msg,
+        )
+        _draw_graph_footer(painter, cfg, playlist, plot_left, plot_right,
+                           canvas_height, FOOTER_H, body_font, small_font)
+        painter.end()
+        return pix
+
+    mmr_values = [p["mmr"] for p in points if isinstance(p["mmr"], (int, float))]
+    mmr_min = min(mmr_values)
+    mmr_max = max(mmr_values)
+    # Pad the y-range so points don't sit on the edge. Always show at least
+    # 100 MMR of vertical span so single-game graphs aren't squashed.
+    span = max(mmr_max - mmr_min, 100)
+    pad = max(20, int(span * 0.15))
+    y_min = max(0, mmr_min - pad)
+    y_max = mmr_max + pad
+
+    def to_x(i: int) -> int:
+        if len(points) == 1:
+            return plot_left + plot_w // 2
+        return plot_left + int(i * plot_w / (len(points) - 1))
+
+    def to_y(mmr: float) -> int:
+        if y_max == y_min:
+            return plot_top + plot_h // 2
+        return plot_bottom - int((mmr - y_min) / (y_max - y_min) * plot_h)
+
+    # ---- Rank zones (faint background bands) ----
+    for lo, hi, _name, color in MMR_RANK_ZONES:
+        if hi < y_min or lo > y_max:
+            continue
+        band_lo = max(lo, y_min)
+        band_hi = min(hi, y_max)
+        y_top = to_y(band_hi)
+        y_bot = to_y(band_lo)
+        c = QColor(color)
+        c.setAlpha(38)  # very faint
+        painter.fillRect(plot_left, y_top, plot_w, y_bot - y_top, QBrush(c))
+
+    # ---- Polyline through every point ----
+    line_pts = [QPoint(to_x(i), to_y(p["mmr"])) for i, p in enumerate(points)]
+    pen = QPen(QColor(C_TEXT))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawPolyline(QPolygon(line_pts))
+
+    # ---- Markers per point ----
+    for i, p in enumerate(points):
+        marker = p.get("marker") or "snap"
+        if marker == "W":
+            color, r = QColor(C_WIN), 4
+        elif marker == "L":
+            color, r = QColor(C_LOSS), 4
+        else:
+            color, r = QColor(C_MUTED), 2
+        painter.setPen(QPen(color))
+        painter.setBrush(QBrush(color))
+        x, y = to_x(i), to_y(p["mmr"])
+        painter.drawEllipse(QPoint(x, y), r, r)
+
+    # ---- Current MMR label at the right edge ----
+    cur_mmr = points[-1]["mmr"]
+    cur_x, cur_y = to_x(len(points) - 1), to_y(cur_mmr)
+    painter.setFont(QFont(font_family, 9, QFont.Bold))
+    painter.setPen(QColor(C_TEXT))
+    label = str(cur_mmr)
+    fm = painter.fontMetrics()
+    label_w = fm.horizontalAdvance(label)
+    # Try to place to the right of the last point; fall back to left if it
+    # would clip the canvas.
+    label_x = cur_x + 8
+    if label_x + label_w > plot_right:
+        label_x = cur_x - label_w - 8
+    painter.drawText(label_x, cur_y + 4, label)
+
+    # ---- Min/max y-axis labels ----
+    painter.setFont(small_font)
+    painter.setPen(QColor(C_MUTED))
+    painter.drawText(plot_left, plot_top + 8, str(y_max))
+    painter.drawText(plot_left, plot_bottom - 1, str(y_min))
+
+    # ---- Per-game delta from start of window ----
+    if len(points) >= 2:
+        delta = points[-1]["mmr"] - points[0]["mmr"]
+        sign = "+" if delta >= 0 else ""
+        delta_color = C_WIN if delta > 0 else (C_LOSS if delta < 0 else C_MUTED)
+        delta_str = f"{sign}{delta} over last {len(points)}"
+        painter.setFont(small_font)
+        painter.setPen(QColor(delta_color))
+        rect = painter.fontMetrics().boundingRect(delta_str)
+        painter.drawText(plot_right - rect.width(), plot_top + 8, delta_str)
+
+    _draw_graph_footer(painter, cfg, playlist, plot_left, plot_right,
+                       canvas_height, FOOTER_H, body_font, small_font)
+    painter.end()
+    return pix
+
+
+def _draw_graph_footer(painter: QPainter, cfg: dict, playlist: str,
+                       left: int, right: int, canvas_height: int, footer_h: int,
+                       body_font: QFont, small_font: QFont) -> None:
+    """Hotkey hints + active playlist label, painted directly onto the
+    pixmap because we're not in HTML mode here."""
+    cycle_label = _first_keyboard_label(cfg.get("graph_playlist_hotkeys") or [])
+    expand_label = _first_keyboard_label(cfg.get("expand_hotkeys") or [])
+    parts = []
+    if expand_label:
+        parts.append(f"{expand_label} session")
+    if cycle_label:
+        parts.append(f"{cycle_label} playlist")
+    hint_text = "  ·  ".join(parts) if parts else ""
+
+    painter.setFont(small_font)
+    painter.setPen(QColor(C_MUTED))
+    base_y = canvas_height - footer_h + 18
+    if hint_text:
+        painter.drawText(left, base_y, hint_text)
+    # Active playlist label, right-aligned.
+    painter.setPen(QColor(C_DIM))
+    pl_label = playlist.upper()
+    rect = painter.fontMetrics().boundingRect(pl_label)
+    painter.drawText(right - rect.width(), base_y, pl_label)
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         with contextlib.suppress(Exception):
@@ -2253,6 +2697,7 @@ def main():
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
     hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
     hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
+    hotkey_graph_pl = HotkeyManager(cfg.get("graph_playlist_hotkeys") or [])
 
     # Sanitize the persisted category once at startup — guards against a hand-edited
     # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
@@ -2267,11 +2712,17 @@ def main():
         "summary_html": "",
         "h2h_html": idle_html("Waiting for Rocket League…"),
         "h2h_expanded": bool(cfg.get("h2h_default_expanded", False)),
+        "session_view": cfg.get("session_view", "session"),
+        "graph_playlist": cfg.get("graph_playlist", "2v2"),
         "roster": [],
         "my_team": 0,
         "arena": "",
         "team_colors": {},
     }
+    if state["session_view"] not in ("session", "graph"):
+        state["session_view"] = "session"
+    if state["graph_playlist"] not in ("1v1", "2v2", "3v3"):
+        state["graph_playlist"] = "2v2"
 
     def _any_visible() -> bool:
         return (state["h2h_held"] or state["session_held"]
@@ -2287,7 +2738,21 @@ def main():
             return
         # Priority: held keys win over the auto-popup. Session > H2H > summary.
         if state["session_held"]:
-            overlay.set_html(render_session_html(session))
+            if state["session_view"] == "graph":
+                _ensure_graph_data_loaded()
+                pix = render_graph_pixmap(
+                    state["graph_playlist"],
+                    mmr_history_cache["snapshots"],
+                    mmr_history_cache["matches"],
+                    cfg,
+                    canvas_width=cfg["width"] - 32,
+                )
+                overlay.set_pixmap(pix)
+            else:
+                overlay.set_html(
+                    render_session_html(session)
+                    + _session_footer_html(cfg, "session")
+                )
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
                 spacer = (
@@ -2388,6 +2853,73 @@ def main():
             mmr_enabled=mmr_client.is_enabled(),
         )
 
+    def _ensure_graph_data_loaded() -> None:
+        """First call (or after `dirty` is set) parses the on-disk files into
+        the in-memory cache. Subsequent calls re-stat both files and reparse
+        only when their mtime changed — cheap, and means polling-loop writes
+        appear in the next graph render without extra plumbing."""
+        try:
+            hist_mtime = MMR_HISTORY_PATH.stat().st_mtime if MMR_HISTORY_PATH.exists() else 0.0
+        except OSError:
+            hist_mtime = 0.0
+        try:
+            match_mtime = MATCHES_PATH.stat().st_mtime if MATCHES_PATH.exists() else 0.0
+        except OSError:
+            match_mtime = 0.0
+        need_load = (
+            not mmr_history_cache["loaded"]
+            or mmr_history_cache["dirty"]
+            or hist_mtime != mmr_history_cache["mtime_history"]
+            or match_mtime != mmr_history_cache["mtime_matches"]
+        )
+        if not need_load:
+            return
+        mmr_history_cache["snapshots"] = load_mmr_history()
+        mmr_history_cache["matches"] = load_matches()
+        mmr_history_cache["mtime_history"] = hist_mtime
+        mmr_history_cache["mtime_matches"] = match_mtime
+        mmr_history_cache["loaded"] = True
+        mmr_history_cache["dirty"] = False
+
+    # Post-match self-MMR polling state. The token is bumped on each new poll
+    # so callbacks scheduled by an earlier poll can self-cancel — important
+    # because back-to-back matches would otherwise produce overlapping polls
+    # whose snapshots interleave in the attribution algorithm.
+    poll_state = {"token": 0, "baseline": None}
+
+    def start_post_match_mmr_poll(self_player: dict) -> None:
+        pid = self_player.get("primaryId") or self_player["key"]
+        name = self_player.get("name") or ""
+        self_id = cfg.get("self_player_id")
+        baseline_entry = mmr_client.get(self_id) if self_id else None
+        baseline = (baseline_entry or {}).get("lastUpdated") or ""
+
+        poll_state["token"] += 1
+        poll_state["baseline"] = baseline
+        my_token = poll_state["token"]
+        delays_ms = [0, 120_000, 240_000, 360_000, 480_000, 600_000]
+        mmr_log(f"poll: scheduled for self={self_id!r} "
+                f"baseline_lastUpdated={baseline!r}")
+
+        def attempt(i: int):
+            if poll_state["token"] != my_token:
+                mmr_log(f"poll: superseded (token {my_token} != "
+                        f"{poll_state['token']}); aborting")
+                return
+            cur = mmr_client.get(self_id) if self_id else None
+            cur_last = (cur or {}).get("lastUpdated") or ""
+            if cur_last and baseline and cur_last > baseline:
+                mmr_log(f"poll: TRN advanced to {cur_last!r} after {i} attempt(s); stopping")
+                return
+            if i >= len(delays_ms):
+                mmr_log("poll: budget exhausted (10 min, 6 attempts)")
+                return
+            mmr_log(f"poll: attempt #{i+1}/{len(delays_ms)} (force-refresh)")
+            mmr_client.enqueue(pid, name, force=True)
+            QTimer.singleShot(120_000, lambda: attempt(i + 1))
+
+        attempt(0)
+
     def on_initialized(payload: dict):
         state["in_match"] = True
         hide_summary()  # next match starting → drop any in-flight post-match popup
@@ -2443,6 +2975,7 @@ def main():
             "winner": payload["winner"],
             "result": "W" if i_won else "L",
             "score": payload.get("score"),
+            "playlist": _playlist_from_player_count(len(payload["players"])),
             "players": payload["players"],
         }
         append_match(record)
@@ -2453,24 +2986,16 @@ def main():
             mt = payload["myTeam"]
             score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
         print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
-        # Force-refresh self MMR after the match. TRN's server-side cache is
-        # 4 min, Psyonix updates instantly — schedule one refresh now (likely
-        # stale) and another at +30s (likely fresh) so we capture the delta
-        # in my_mmr.log even when TRN's edge happened to be hot.
+        # Force-refresh self MMR after the match — TRN's edge cache is sticky
+        # (we observed ~8 min of staleness in practice), so we poll every 2 min
+        # for up to 10 min and stop early once TRN's lastUpdated actually rolls
+        # past where we started. See start_post_match_mmr_poll() below.
         self_id = cfg.get("self_player_id")
         if mmr_client.is_enabled() and self_id:
             self_player = next((p for p in payload["players"]
                                 if p["key"] == self_id), None)
             if self_player:
-                pid = self_player.get("primaryId") or self_player["key"]
-                name = self_player.get("name") or ""
-                mmr_log(f"on_ended: forcing self MMR refresh now + at +30s")
-                mmr_client.enqueue(pid, name, force=True)
-                # Single-shot delayed refresh — give TRN time to roll its cache.
-                QTimer.singleShot(
-                    30_000,
-                    lambda: mmr_client.enqueue(pid, name, force=True),
-                )
+                start_post_match_mmr_poll(self_player)
         # Auto-popup the post-match summary card. Stays up until the next match
         # starts (match_initialized) or the user leaves to the menu (match_destroyed),
         # with a 30s safety net for cases where neither event fires.
@@ -2515,13 +3040,41 @@ def main():
     hotkey_session.released.connect(on_session_released)
 
     def toggle_expand():
-        state["h2h_expanded"] = not state["h2h_expanded"]
-        cfg["h2h_default_expanded"] = state["h2h_expanded"]
-        save_config(cfg)
-        print(f"[overlay] expanded={state['h2h_expanded']}", file=sys.stderr)
+        # Context-sensitive: when F12 is held, F11 swaps the session sub-view
+        # between session card and graph. Otherwise (Tab held or nothing
+        # held), it keeps the existing H2H-expand toggle behavior.
+        if state["session_held"]:
+            nxt = "graph" if state["session_view"] == "session" else "session"
+            state["session_view"] = nxt
+            cfg["session_view"] = nxt
+            save_config(cfg)
+            print(f"[overlay] session_view={nxt}", file=sys.stderr)
+        else:
+            state["h2h_expanded"] = not state["h2h_expanded"]
+            cfg["h2h_default_expanded"] = state["h2h_expanded"]
+            save_config(cfg)
+            print(f"[overlay] expanded={state['h2h_expanded']}", file=sys.stderr)
         update_overlay()
 
     hotkey_expand.pressed.connect(toggle_expand)
+
+    GRAPH_PLAYLISTS = ("1v1", "2v2", "3v3")
+
+    def cycle_graph_playlist():
+        # No-op unless the user is actually looking at the graph — F9 should
+        # not change persistent state when held outside of session+graph view.
+        if not (state["session_held"] and state["session_view"] == "graph"):
+            return
+        cur = state["graph_playlist"]
+        i = GRAPH_PLAYLISTS.index(cur) if cur in GRAPH_PLAYLISTS else -1
+        nxt = GRAPH_PLAYLISTS[(i + 1) % len(GRAPH_PLAYLISTS)]
+        state["graph_playlist"] = nxt
+        cfg["graph_playlist"] = nxt
+        save_config(cfg)
+        print(f"[overlay] graph_playlist={nxt}", file=sys.stderr)
+        update_overlay()
+
+    hotkey_graph_pl.pressed.connect(cycle_graph_playlist)
 
     def cycle_mmr_category():
         cur = cfg.get("mmr_category", "best")
@@ -2541,6 +3094,17 @@ def main():
     # Tracks the last self entry we logged so we can compute deltas (and skip
     # writes when nothing has changed). Seeded from disk cache below.
     last_self_log = {"playlists": {}, "lastUpdated": None}
+
+    # Lazy cache for mmr_history.jsonl. We don't load at startup — the graph
+    # view is opened by maybe 1% of users on any given session, so we pay the
+    # parse cost only on first F11-from-session. The `dirty` flag is set by
+    # _log_my_mmr after a history append, telling the graph render to reparse
+    # before drawing. mtime-based invalidation also guards against external
+    # edits.
+    mmr_history_cache = {
+        "loaded": False, "snapshots": [], "matches": [],
+        "mtime_history": 0.0, "mtime_matches": 0.0, "dirty": False,
+    }
 
     def _log_my_mmr(entry: dict):
         """Append one line per *meaningful* refresh to my_mmr.log: per-playlist
@@ -2587,6 +3151,22 @@ def main():
                 f.write(line + "\n")
         except OSError as e:
             mmr_log(f"my_mmr.log write failed: {e}")
+        # Persist a structured snapshot to mmr_history.jsonl for the graph
+        # view. Stricter dedupe than the log: only write when TRN's
+        # lastUpdated actually advanced (or first entry ever) — otherwise
+        # the attribution algorithm could double-count an interval.
+        if trn_rolled or first_entry:
+            snap = {
+                "ts": now_iso(),
+                "trn_lastUpdated": last_updated,
+                "playlists": {
+                    lbl: (cur.get(lbl) or {}).get("mmr")
+                    for lbl in ("1v1", "2v2", "3v3")
+                    if (cur.get(lbl) or {}).get("mmr") is not None
+                },
+            }
+            append_mmr_history(snap)
+            mmr_history_cache["dirty"] = True
         last_self_log["playlists"] = cur
         last_self_log["lastUpdated"] = last_updated
 
@@ -2761,6 +3341,7 @@ def main():
     hotkey_session.start()
     hotkey_expand.start()
     hotkey_cycle.start()
+    hotkey_graph_pl.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
           f"expand={cfg.get('expand_hotkeys') or []} "
@@ -2779,6 +3360,7 @@ def main():
     hotkey_session.stop()
     hotkey_expand.stop()
     hotkey_cycle.stop()
+    hotkey_graph_pl.stop()
     mmr_client.stop()
     sys.exit(rc)
 

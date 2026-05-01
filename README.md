@@ -84,18 +84,23 @@ To launch automatically every time Windows boots, press **Win + R**, type `shell
 
 The overlay is **held**, not toggled. Defaults match Rocket League's stock scoreboard binding so you can naturally peek at both at the same time.
 
-| Action               | PC      | Xbox    | PlayStation |
-|----------------------|---------|---------|-------------|
-| Head-to-head         | **Tab** | **LB**  | **L1**      |
-| Session stats        | **F12** | —       | —           |
-| Toggle expanded H2H  | **F11** | —       | —           |
-| Cycle MMR category   | **F10** | —       | —           |
+| Action                          | PC      | Xbox    | PlayStation |
+|---------------------------------|---------|---------|-------------|
+| Head-to-head                    | **Tab** | **LB**  | **L1**      |
+| Session stats / MMR graph       | **F12** | —       | —           |
+| Toggle expanded H2H *or* graph  | **F11** | —       | —           |
+| Cycle MMR category              | **F10** | —       | —           |
+| Cycle graph playlist            | **F9**  | —       | —           |
 
 Hold to show; release to hide. Multiple bindings can be combined; the overlay shows while *any* of them is held.
 
-**F11** toggles whether the H2H overlay also shows the session stats card underneath. The choice persists across launches (saved to `config.json`).
+**F11** is context-sensitive:
+- While **Tab** is held (or nothing is held): toggles whether the H2H card also shows the session stats below. The choice persists across launches.
+- While **F12** is held: swaps the session card to a **MMR graph** view of your last 30 ranked matches for the selected playlist, with W/L markers, faint rank-zone bands behind the line, and your net MMR delta over the visible window. Same key, second press → back to the session card.
 
-**F10** cycles the MMR category shown next to each opponent — `best → 1v1 → 2v2 → 3v3 → best`. The active category is shown in the H2H header (`MMR · BEST`) and the footer hint. The choice persists. F10 only does anything if MMR display is enabled — see below.
+**F10** cycles the MMR category shown next to each opponent in the H2H card — `best → 1v1 → 2v2 → 3v3 → best`. The active category is shown in the H2H header (`MMR · BEST`) and the footer hint. The choice persists. F10 only does anything if MMR display is enabled — see below.
+
+**F9** cycles the playlist plotted in the graph view — `1v1 → 2v2 → 3v3`. Only active while F12 is held *and* you're on the graph (not the session card). The choice persists.
 
 ## MMR display
 
@@ -109,6 +114,18 @@ Defaults to "best" — the highest MMR across the three competitive playlists (1
 - **Throttle**: at most one outbound request every 2 seconds. A full 3v3 lobby's MMR resolves in under 6s.
 - **Lookup limit**: the tracker indexes by display name. If a console player has just renamed (or has a name that's not unique), they'll show as `—`. Epic, PSN, Xbox, Switch, Steam are all supported in principle, but coverage depends on whether the player is registered on tracker.network.
 
+### Tracking your own MMR over time
+
+When MMR display is enabled, the script also persists your own MMR snapshots to `mmr_history.jsonl` (one line per snapshot, only when TRN's data actually advances), and after every `MatchEnded` it polls TRN every 2 minutes for up to 10 min until your snapshot rolls. That's the data feeding the graph view.
+
+The graph approximates **per-game** MMR change from the cumulative snapshots. Algorithm: between two snapshots showing a delta of *D* MMR, with *W* wins and *L* losses recorded in that window, each win contributes `+|D|/|W−L|` and each loss `−|D|/|W−L|`. Examples:
+- 2W + 1L net **+10** → step = 10 → `+10 / +10 / -10`
+- 4W + 2L net **+36** → step = 18 → `+18 / +18 / +18 / +18 / -18 / -18`
+
+When wins == losses (net zero), the step is the rolling median of past intervals' steps so deep-season MMR (which barely moves) still produces a sensible chart. The line is also reconciled to the actual snapshot value at every interval boundary, so rounding can't drift off truth.
+
+To wipe the graph data: delete `mmr_history.jsonl` next to the script.
+
 ## Config
 
 Settings live in `config.json` (created on first run). The file is **gitignored**, so `git pull` never overwrites your local edits. When new options are added in a future version, your existing values are preserved and only the new keys are merged in. The top of the file has comments listing every supported keyboard and gamepad key name. Common tweaks:
@@ -120,7 +137,7 @@ Settings live in `config.json` (created on first run). The file is **gitignored*
 - `mmr_enabled` — `true` enables opponent MMR lookup against tracker.network. Off by default; flip via the tray menu so you see the privacy note.
 - `mmr_category` — `"best" | "1v1" | "2v2" | "3v3"`. Cycled live with **F10**.
 
-To wipe your match history, delete `matches.jsonl` and `players.json`.
+To wipe your match history, delete `matches.jsonl` and `players.json`. To wipe the MMR graph data, delete `mmr_history.jsonl`.
 
 ## Privacy
 
