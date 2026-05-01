@@ -1,0 +1,25 @@
+# User data — generated at runtime, do not commit
+config.json
+config.json.tmp
+matches.jsonl
+players.json
+players.json.tmp
+players.corrupt-*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch / tooling
+.playwright-mcp/
+rl_api_text.md
