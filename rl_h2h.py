@@ -1381,7 +1381,14 @@ class MatchStats:
 
 
 def make_tray_icon() -> QIcon:
-    """Programmatic tray icon — dark circle with a lime 'H' (Head-to-head)."""
+    """Tray icon. Prefers icon.ico/icon.png next to the script; falls back to a
+    programmatic dark-circle-with-lime-H if neither is present."""
+    for name in ("icon.ico", "icon.png"):
+        path = APP_DIR / name
+        if path.exists():
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
     pix = QPixmap(32, 32)
     pix.fill(Qt.transparent)
     p = QPainter(pix)
