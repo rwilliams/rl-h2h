@@ -35,6 +35,7 @@ EVT_ROUND_STARTED = "RoundStarted"
 EVT_UPDATE_STATE = "UpdateState"
 EVT_MATCH_ENDED = "MatchEnded"
 EVT_MATCH_DESTROYED = "MatchDestroyed"
+EVT_REPLAY_CREATED = "ReplayCreated"
 
 BUCKET_VS = "vs"
 BUCKET_WITH = "with"
@@ -42,11 +43,117 @@ BUCKET_WITH = "with"
 VALID_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-right")
 SPECTATOR_FIELDS = ("Boost", "bBoosting", "bOnGround", "bOnWall", "bSupersonic")
 
+DEFAULT_TEAM_COLORS = {0: "#3B9EFF", 1: "#FF7A29"}
+
+
+# Map RL arena asset names to human-friendly labels. Variants (Night/Day/Stormy/...) are
+# composed at runtime: e.g. "TrainStation_Night_P" -> "Urban Central (Night)".
+ARENA_BASE = {
+    "stadium":              "DFH Stadium",
+    "park":                 "Mannfield",
+    "trainstation":         "Urban Central",
+    "haunted_trainstation": "Urban Central (Haunted)",
+    "underwater":           "AquaDome",
+    "wasteland":            "Wasteland",
+    "neotokyo":             "Neo Tokyo",
+    "neotokyo_standard":    "Neo Tokyo",
+    "eurostadium":          "Champions Field",
+    "beach":                "Salty Shores",
+    "beachvolley":          "Salty Shores",
+    "chinastadium":         "Forbidden Temple",
+    "cosmic":               "Starbase ARC",
+    "arc_standard":         "Starbase ARC",
+    "throwback_stadium":    "Throwback Stadium",
+    "hoops_dunkhouse":      "DunkHouse",
+    "music":                "Estadio Vida",
+    "estadio_vida":         "Estadio Vida",
+    "farm":                 "Farmstead",
+    "outlaw_oasis":         "Deadeye Canyon",
+    "shattershot":          "Champions Field (Snow Day)",
+    "labs_octagon":         "Octagon",
+    "labs_pillars":         "Pillars",
+    "labs_cosmic":          "Cosmic",
+    "labs_double_goal":     "Double Goal",
+    "labs_underpass":       "Underpass",
+    "labs_utopia":          "Utopia Retro",
+    "neoasphalt":           "Neon Fields",
+}
+ARENA_VARIANT = {
+    "night":   "Night",
+    "day":     "Day",
+    "rainy":   "Stormy",
+    "stormy":  "Stormy",
+    "race_day": "Stormy",
+    "snowy":   "Snowy",
+    "snowfall": "Snowy",
+    "dawn":    "Dawn",
+    "spring":  "Spring",
+    "spooky":  "Spooky",
+    "circuit": "Circuit",
+    "p":       "",  # bare _P leftover
+}
+
+
+def pretty_arena(asset: str) -> str:
+    if not asset:
+        return ""
+    base = asset.lower()
+    if base.endswith("_p"):
+        base = base[:-2]
+    if base in ARENA_BASE:
+        return ARENA_BASE[base]
+    parts = base.split("_")
+    for i in range(len(parts), 0, -1):
+        candidate = "_".join(parts[:i])
+        if candidate in ARENA_BASE:
+            variant_key = "_".join(parts[i:])
+            if not variant_key:
+                return ARENA_BASE[candidate]
+            label = ARENA_VARIANT.get(variant_key, variant_key.replace("_", " ").title())
+            return f"{ARENA_BASE[candidate]} ({label})" if label else ARENA_BASE[candidate]
+    return base.replace("_", " ").title()
+
+
+# Gamepad button name → (inputs.event_type, inputs.event_code, target_value).
+# 'thresh' for analog triggers means "treat ≥ THRESHOLD as pressed".
+GAMEPAD_BUTTONS = {
+    "a":           ("Key", "BTN_SOUTH",  1),    # Xbox A / PS Cross
+    "b":           ("Key", "BTN_EAST",   1),    # Xbox B / PS Circle
+    "x":           ("Key", "BTN_WEST",   1),    # Xbox X / PS Square
+    "y":           ("Key", "BTN_NORTH",  1),    # Xbox Y / PS Triangle
+    "lb":          ("Key", "BTN_TL",     1),    # Xbox LB / PS L1
+    "rb":          ("Key", "BTN_TR",     1),    # Xbox RB / PS R1
+    "back":        ("Key", "BTN_SELECT", 1),    # Xbox Back/View / PS Share
+    "start":       ("Key", "BTN_START",  1),    # Xbox Start/Menu / PS Options
+    "lstick":      ("Key", "BTN_THUMBL", 1),    # left stick click
+    "rstick":      ("Key", "BTN_THUMBR", 1),    # right stick click
+    "dpad_up":     ("Absolute", "ABS_HAT0Y", -1),
+    "dpad_down":   ("Absolute", "ABS_HAT0Y",  1),
+    "dpad_left":   ("Absolute", "ABS_HAT0X", -1),
+    "dpad_right":  ("Absolute", "ABS_HAT0X",  1),
+    "lt":          ("Absolute", "ABS_Z",   "thresh"),  # Xbox LT / PS L2
+    "rt":          ("Absolute", "ABS_RZ",  "thresh"),  # Xbox RT / PS R2
+}
+GAMEPAD_TRIGGER_THRESHOLD = 80  # 0..255
+
 
 DEFAULT_CONFIG = {
+    "_comments": [
+        "hotkeys: list of triggers that show the overlay while held.",
+        "Keyboard: 'tab', 'f1', 'f2', 'caps_lock', 'shift', 'esc', 'space', or a single char like 'h'.",
+        "Gamepad (Xbox / PlayStation), prefix with 'pad_':",
+        "  Buttons:  pad_a (Xbox A / PS X), pad_b (B / Circle), pad_x (X / Square), pad_y (Y / Triangle)",
+        "  Bumpers:  pad_lb (LB / L1), pad_rb (RB / R1)",
+        "  Triggers: pad_lt (LT / L2), pad_rt (RT / R2)",
+        "  D-pad:    pad_dpad_up, pad_dpad_down, pad_dpad_left, pad_dpad_right",
+        "  Other:    pad_back (Xbox View / PS Share), pad_start (Menu / Options),",
+        "            pad_lstick (left stick click), pad_rstick (right stick click)",
+        "Gamepad bindings require: pip install inputs",
+        "position: top-left | top-center | top-right | bottom-left | bottom-right"
+    ],
     "host": "127.0.0.1",
     "port": 49123,
-    "hotkey": "tab",
+    "hotkeys": ["tab", "pad_dpad_down"],
     "position": "top-right",
     "margin": 24,
     "width": 380,
@@ -65,13 +172,29 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    loaded: Optional[dict] = None
     if CONFIG_PATH.exists():
         try:
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
         except Exception as e:
             print(f"[config] failed to parse {CONFIG_PATH}: {e}", file=sys.stderr)
-    else:
-        atomic_write_text(CONFIG_PATH, json.dumps(DEFAULT_CONFIG, indent=2))
+    # Backward compat: 'hotkey' (single str) → 'hotkeys' (list).
+    if not cfg.get("hotkeys"):
+        legacy = cfg.get("hotkey")
+        cfg["hotkeys"] = [legacy] if isinstance(legacy, str) and legacy else ["tab"]
+    elif isinstance(cfg["hotkeys"], str):
+        cfg["hotkeys"] = [cfg["hotkeys"]]
+    # Rewrite the file if it's missing any new default keys (e.g. _comments, hotkeys),
+    # so users see the latest hints next time they open it.
+    needs_rewrite = (loaded is None) or any(k not in loaded for k in DEFAULT_CONFIG)
+    if needs_rewrite:
+        out = {k: cfg[k] for k in cfg if k != "hotkey"}
+        try:
+            atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2))
+        except Exception as e:
+            print(f"[config] could not rewrite {CONFIG_PATH}: {e}", file=sys.stderr)
     return cfg
 
 
@@ -114,12 +237,17 @@ def update_players_cache(players: dict, match: dict) -> None:
     my_team = match["myTeam"]
     i_won = match["winner"] == my_team
     when = match["endedAt"]
+    score = match.get("score")  # [blue, orange]
+    if isinstance(score, list) and len(score) == 2:
+        my_pov = [score[my_team], score[1 - my_team]]
+    else:
+        my_pov = None
     for p in match["players"]:
         rec = players.setdefault(p["key"], {
             "name": p["name"],
             "aliases": [p["name"]],
-            BUCKET_VS:   {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None},
-            BUCKET_WITH: {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None},
+            BUCKET_VS:   {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None, "lastScore": None},
+            BUCKET_WITH: {"wins": 0, "losses": 0, "lastSeenAt": None, "lastResult": None, "lastScore": None},
         })
         rec["name"] = p["name"]
         if p["name"] not in rec["aliases"]:
@@ -131,6 +259,7 @@ def update_players_cache(players: dict, match: dict) -> None:
             rec[bucket]["losses"] += 1
         rec[bucket]["lastSeenAt"] = when
         rec[bucket]["lastResult"] = "W" if i_won else "L"
+        rec[bucket]["lastScore"] = my_pov
 
 
 class StatsClient(QObject):
@@ -165,6 +294,9 @@ class StatsClient(QObject):
         self._match_guid: Optional[str] = None
         self._initialized_emitted = False
         self._spectator_warned = False
+        self._score: list[int] = [0, 0]
+        self._team_colors: dict[int, str] = {}
+        self._in_replay: bool = False
 
     def start(self):
         self._thread.start()
@@ -244,7 +376,7 @@ class StatsClient(QObject):
                     msgs_total += 1
                     self._safe_handle(obj)
                 now = loop.time()
-                if now - last_alive >= 10.0:
+                if now - last_alive >= 60.0:
                     last_alive = now
                     print(f"[tcp] alive: bytes={bytes_total} msgs={msgs_total} "
                           f"events={{{self._event_summary()}}}", file=sys.stderr)
@@ -303,8 +435,10 @@ class StatsClient(QObject):
             print(f"[evt] MatchCreated guid={guid!r}", file=sys.stderr)
             self._reset()
             self._match_guid = data.get("MatchGuid")
-        elif event in (EVT_MATCH_INITIALIZED, EVT_ROUND_STARTED):
+        elif event == EVT_MATCH_INITIALIZED:
             print(f"[evt] {event}", file=sys.stderr)
+            self._maybe_emit_initialized()
+        elif event == EVT_ROUND_STARTED:
             self._maybe_emit_initialized()
         elif event == EVT_MATCH_ENDED:
             print(f"[evt] MatchEnded data={data}", file=sys.stderr)
@@ -313,12 +447,12 @@ class StatsClient(QObject):
             print("[evt] MatchDestroyed", file=sys.stderr)
             self.match_destroyed.emit()
             self._reset()
+        elif event == EVT_REPLAY_CREATED:
+            print("[evt] ReplayCreated — entering replay mode, recording paused", file=sys.stderr)
+            self._in_replay = True
 
     def _on_update_state(self, data: dict):
-        # Hot path. Once the roster + side are locked in, skip everything.
-        if self._initialized_emitted:
-            return
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or self._in_replay:
             return
         game = data.get("Game")
         if isinstance(game, dict):
@@ -326,6 +460,24 @@ class StatsClient(QObject):
             if isinstance(arena, str) and arena and arena != self._arena:
                 print(f"[state] arena={arena!r}", file=sys.stderr)
                 self._arena = arena
+            teams = game.get("Teams")
+            if isinstance(teams, list):
+                for t in teams:
+                    if not isinstance(t, dict):
+                        continue
+                    tn = t.get("TeamNum")
+                    if tn not in (0, 1):
+                        continue
+                    sc = t.get("Score")
+                    if isinstance(sc, int):
+                        self._score[int(tn)] = sc
+                    cp = t.get("ColorPrimary")
+                    if (int(tn) not in self._team_colors and isinstance(cp, str)
+                            and len(cp) == 6):
+                        self._team_colors[int(tn)] = "#" + cp.upper()
+        # Roster + my_team detection only runs until we've emitted match_initialized.
+        if self._initialized_emitted:
+            return
         players = data.get("Players")
         if not isinstance(players, list):
             return
@@ -355,8 +507,7 @@ class StatsClient(QObject):
         # If both teams report them, the user is spectating — leave my_team unset.
         if self._my_team is None and len(spectator_team_hits) == 1:
             (self._my_team,) = spectator_team_hits
-            print(f"[state] my_team={self._my_team} "
-                  f"(spectator-hit teams: {spectator_team_hits})", file=sys.stderr)
+            print(f"[state] my_team={self._my_team}", file=sys.stderr)
         elif self._my_team is None and len(spectator_team_hits) > 1 and not self._spectator_warned:
             self._spectator_warned = True
             print(f"[state] spectator mode? both teams report spectator fields: "
@@ -364,23 +515,29 @@ class StatsClient(QObject):
         self._maybe_emit_initialized()
 
     def _on_match_ended(self, data: dict):
+        if self._in_replay:
+            print("[emit] MatchEnded skipped: in replay", file=sys.stderr)
+            return
         winner = data.get("WinnerTeamNum")
         if winner is None or self._my_team is None or not self._roster:
             print(f"[emit] MatchEnded skipped: winner={winner} my_team={self._my_team} "
                   f"roster={len(self._roster)}", file=sys.stderr)
             return
         print(f"[emit] match_ended winner={winner} my_team={self._my_team} "
-              f"roster={len(self._roster)}", file=sys.stderr)
+              f"roster={len(self._roster)} score={self._score}", file=sys.stderr)
         self.match_ended.emit({
             "winner": int(winner),
             "myTeam": self._my_team,
             "arena": self._arena,
             "matchGuid": self._match_guid,
             "players": list(self._roster.values()),
+            "score": list(self._score),
+            "teamColors": dict(self._team_colors),
         })
 
     def _maybe_emit_initialized(self):
-        if self._initialized_emitted or self._my_team is None or not self._roster:
+        if (self._initialized_emitted or self._in_replay
+                or self._my_team is None or not self._roster):
             return
         teams = {p["team"] for p in self._roster.values()}
         if len(teams) < 2:
@@ -390,53 +547,147 @@ class StatsClient(QObject):
               f"roster={len(self._roster)} teams={sorted(teams)} arena={self._arena!r}",
               file=sys.stderr)
         self.match_initialized.emit({
+            "teamColors": dict(self._team_colors),
             "arena": self._arena,
             "myTeam": self._my_team,
             "players": list(self._roster.values()),
         })
 
 
-class HotkeyBridge(QObject):
+class HotkeyManager(QObject):
+    """Multi-trigger keyboard + gamepad listener.
+
+    Emits `pressed` when going from no-triggers-held to at-least-one-held, and `released`
+    when the last held trigger is let go. Holding multiple bindings simultaneously is
+    supported (overlay stays up until *all* are released).
+    """
+
     pressed = Signal()
     released = Signal()
 
-    def __init__(self, hotkey_name: str):
+    def __init__(self, hotkey_names: list[str]):
         super().__init__()
-        self._target = self._parse(hotkey_name.lower())
-        self._down = False
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self._kb_targets: list[tuple] = []
+        self._pad_targets: list[str] = []
+        for raw in hotkey_names:
+            name = raw.strip().lower()
+            if not name:
+                continue
+            if name.startswith("pad_"):
+                pad_name = name[4:]
+                if pad_name in GAMEPAD_BUTTONS:
+                    self._pad_targets.append(pad_name)
+                else:
+                    print(f"[hotkey] unknown gamepad key {raw!r}; "
+                          f"valid: {sorted(GAMEPAD_BUTTONS)}", file=sys.stderr)
+            else:
+                self._kb_targets.append(self._parse_kb(name))
+        self._down: set[tuple] = set()
+        self._kb_listener = keyboard.Listener(
+            on_press=self._on_kb_press, on_release=self._on_kb_release,
+        )
+        self._pad_thread: Optional[threading.Thread] = None
+        self._pad_stop = threading.Event()
+        if self._pad_targets:
+            self._pad_thread = threading.Thread(
+                target=self._pad_loop, daemon=True, name="GamepadListener",
+            )
 
     @staticmethod
-    def _parse(name: str):
+    def _parse_kb(name: str):
         if hasattr(keyboard.Key, name):
-            return getattr(keyboard.Key, name)
-        if len(name) != 1:
-            raise ValueError(
-                f"Unknown hotkey '{name}'. Use a single char (e.g. 'h') or a "
-                "pynput special key name (e.g. 'tab', 'f1', 'caps_lock', 'shift')."
-            )
-        return keyboard.KeyCode.from_char(name)
+            return ("special", getattr(keyboard.Key, name))
+        if len(name) == 1:
+            return ("char", name)
+        raise ValueError(
+            f"Unknown keyboard key {name!r}. Use 'tab', 'f1', 'shift' (etc.), "
+            "a single char like 'h', or prefix with 'pad_' for a gamepad button."
+        )
 
-    def _matches(self, key) -> bool:
-        if isinstance(self._target, keyboard.Key):
-            return key == self._target
-        return getattr(key, "char", None) == self._target.char
+    def _kb_match(self, key, target) -> bool:
+        kind, value = target
+        if kind == "special":
+            return key == value
+        return getattr(key, "char", None) == value
 
-    def _on_press(self, key):
-        if self._matches(key) and not self._down:
-            self._down = True
+    def _on_kb_press(self, key):
+        for t in self._kb_targets:
+            if self._kb_match(key, t):
+                self._add_down(("kb",) + t)
+                return
+
+    def _on_kb_release(self, key):
+        for t in self._kb_targets:
+            if self._kb_match(key, t):
+                self._remove_down(("kb",) + t)
+                return
+
+    def _add_down(self, key_id: tuple):
+        was_empty = not self._down
+        self._down.add(key_id)
+        if was_empty:
             self.pressed.emit()
 
-    def _on_release(self, key):
-        if self._matches(key) and self._down:
-            self._down = False
+    def _remove_down(self, key_id: tuple):
+        self._down.discard(key_id)
+        if not self._down:
             self.released.emit()
 
+    def _pad_loop(self):
+        try:
+            import inputs as _inputs
+        except ImportError:
+            print("[hotkey] gamepad bindings configured but 'inputs' is not installed. "
+                  "Run: pip install inputs", file=sys.stderr)
+            return
+        wanted: dict[tuple, list[tuple]] = {}
+        for pad_name in self._pad_targets:
+            etype, ecode, target_val = GAMEPAD_BUTTONS[pad_name]
+            wanted.setdefault((etype, ecode), []).append((pad_name, target_val))
+        active: dict[str, bool] = {}
+        warned_no_pad = False
+        print(f"[hotkey] gamepad listener watching: {self._pad_targets}", file=sys.stderr)
+        while not self._pad_stop.is_set():
+            try:
+                events = _inputs.get_gamepad()
+            except _inputs.UnpluggedError:
+                if not warned_no_pad:
+                    print("[hotkey] no gamepad detected; will keep watching", file=sys.stderr)
+                    warned_no_pad = True
+                self._pad_stop.wait(2.0)
+                continue
+            except Exception as e:
+                print(f"[hotkey] gamepad read error: {type(e).__name__}: {e}", file=sys.stderr)
+                self._pad_stop.wait(2.0)
+                continue
+            warned_no_pad = False
+            for ev in events:
+                key = (ev.ev_type, ev.code)
+                if key not in wanted:
+                    continue
+                for pad_name, target_val in wanted[key]:
+                    if target_val == "thresh":
+                        is_pressed = ev.state >= GAMEPAD_TRIGGER_THRESHOLD
+                    elif ev.ev_type == "Absolute":
+                        is_pressed = ev.state == target_val
+                    else:
+                        is_pressed = ev.state == 1
+                    was = active.get(pad_name, False)
+                    if is_pressed and not was:
+                        active[pad_name] = True
+                        self._add_down(("pad", pad_name))
+                    elif not is_pressed and was:
+                        active[pad_name] = False
+                        self._remove_down(("pad", pad_name))
+
     def start(self):
-        self._listener.start()
+        self._kb_listener.start()
+        if self._pad_thread is not None:
+            self._pad_thread.start()
 
     def stop(self):
-        self._listener.stop()
+        self._kb_listener.stop()
+        self._pad_stop.set()
 
 
 class Overlay(QWidget):
@@ -577,11 +828,20 @@ def _player_row(p: dict, my_team: int, players_db: dict) -> str:
         )
         when = humanize_when(b["lastSeenAt"])
         res = b["lastResult"]
+        last_score = b.get("lastScore")
         if when and res:
             res_color = C_WIN if res == "W" else C_LOSS
+            score_part = ""
+            if isinstance(last_score, list) and len(last_score) == 2:
+                score_part = (
+                    f"&nbsp;<span style='color:{C_MUTED};"
+                    "font-family:Consolas,\"SF Mono\",monospace;'>"
+                    f"({last_score[0]}&ndash;{last_score[1]})</span>"
+                )
             sub = (
                 f"<span style='color:{C_MUTED};font-size:8pt;'>"
                 f"{when}&nbsp;<span style='color:{res_color};font-weight:700;'>{res}</span>"
+                f"{score_part}"
                 "</span>"
             )
         else:
@@ -645,12 +905,21 @@ def _team_section(label: str, color: str, players: list, is_you: bool, my_team: 
     return header + "<div style='height:4px;font-size:1px;line-height:1px;'>&nbsp;</div>" + body_block
 
 
-def render_html(roster: list[dict], my_team: int, arena: str, players_db: dict) -> str:
+def render_html(roster: list[dict], my_team: int, arena: str,
+                players_db: dict, team_colors: dict) -> str:
     blue = sorted([p for p in roster if p["team"] == 0], key=lambda x: x["name"].lower())
     orange = sorted([p for p in roster if p["team"] == 1], key=lambda x: x["name"].lower())
 
-    if arena:
-        a = arena if len(arena) <= 22 else arena[:21] + "…"
+    blue_color = team_colors.get(0) if isinstance(team_colors, dict) else None
+    orange_color = team_colors.get(1) if isinstance(team_colors, dict) else None
+    if not isinstance(blue_color, str) or not blue_color.startswith("#"):
+        blue_color = C_BLUE
+    if not isinstance(orange_color, str) or not orange_color.startswith("#"):
+        orange_color = C_ORANGE
+
+    arena_label = pretty_arena(arena)
+    if arena_label:
+        a = arena_label if len(arena_label) <= 22 else arena_label[:21] + "…"
         arena_cell = (
             f"<td align='right' style='color:{C_MUTED};font-size:8pt;font-weight:500;"
             f"letter-spacing:0.10em;'>{a.upper()}</td>"
@@ -674,9 +943,9 @@ def render_html(roster: list[dict], my_team: int, arena: str, players_db: dict) 
     spacer = "<div style='height:10px;font-size:1px;line-height:1px;'>&nbsp;</div>"
     return (
         header
-        + _team_section("BLUE",   C_BLUE,   blue,   my_team == 0, my_team, players_db)
+        + _team_section("BLUE",   blue_color,   blue,   my_team == 0, my_team, players_db)
         + spacer
-        + _team_section("ORANGE", C_ORANGE, orange, my_team == 1, my_team, players_db)
+        + _team_section("ORANGE", orange_color, orange, my_team == 1, my_team, players_db)
     )
 
 
@@ -696,13 +965,16 @@ def main():
 
     overlay = Overlay(cfg)
     stats = StatsClient(cfg["host"], cfg["port"])
-    hotkey = HotkeyBridge(cfg["hotkey"])
+    hotkey = HotkeyManager(cfg["hotkeys"])
 
     state = {"in_match": False}
 
     def on_initialized(payload: dict):
         state["in_match"] = True
-        html = render_html(payload["players"], payload["myTeam"], payload["arena"], players_db)
+        html = render_html(
+            payload["players"], payload["myTeam"], payload["arena"],
+            players_db, payload.get("teamColors") or {},
+        )
         overlay.set_html(html)
         print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
 
@@ -716,12 +988,17 @@ def main():
             "myTeam": payload["myTeam"],
             "winner": payload["winner"],
             "result": "W" if i_won else "L",
+            "score": payload.get("score"),
             "players": payload["players"],
         }
         append_match(record)
         update_players_cache(players_db, record)
         save_players(players_db)
-        print(f"[match] ended {'WIN' if i_won else 'LOSS'}")
+        score_str = ""
+        if isinstance(record.get("score"), list) and len(record["score"]) == 2:
+            mt = payload["myTeam"]
+            score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
+        print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
 
     def on_destroyed():
         state["in_match"] = False
@@ -752,7 +1029,8 @@ def main():
     stats.start()
     hotkey.start()
 
-    print(f"[ready] hotkey='{cfg['hotkey']}' position={cfg['position']} ws://{cfg['host']}:{cfg['port']}")
+    print(f"[ready] hotkeys={cfg['hotkeys']} position={cfg['position']} "
+          f"tcp://{cfg['host']}:{cfg['port']}")
     print(f"        matches → {MATCHES_PATH.name}")
     print(f"        players → {PLAYERS_PATH.name}")
 
