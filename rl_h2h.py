@@ -1195,32 +1195,38 @@ def _opt_int(v) -> str:
     return str(int(v)) if v else EM_DASH
 
 
-def _pair_max(scope_v: float, self_v: float) -> str:
+def _pair_max(scope_v: float, self_v: float, always_pair: bool = False) -> str:
     """Render a max-style stat as 'scope | yours'. Scope >= self_v always.
-    If you own the scope max, drop the pair to a single number."""
+
+    If you own the scope max the pair collapses to a single number to keep
+    the session card compact. Pass `always_pair=True` (used by the post-match
+    summary) to always show both values — clearer when the user explicitly
+    wants 'match | mine' for every row."""
     if scope_v <= 0:
         return EM_DASH
-    if self_v >= scope_v:
+    if not always_pair and self_v >= scope_v:
         return str(int(scope_v))
     right = str(int(self_v)) if self_v > 0 else EM_DASH
     return f"{int(scope_v)}{_PAIR_SEP}{right}"
 
 
-def _pair_count(scope_v: int, self_v: int) -> str:
-    """Render a counter (saves/shots/demos/crossbars) as 'scope | yours'."""
+def _pair_count(scope_v: int, self_v: int, always_pair: bool = False) -> str:
+    """Render a counter (saves/shots/demos/crossbars) as 'scope | yours'.
+    See `_pair_max` for the `always_pair` flag."""
     if scope_v <= 0:
         return EM_DASH
-    if self_v >= scope_v:
+    if not always_pair and self_v >= scope_v:
         return str(int(scope_v))
     right = str(int(self_v)) if self_v > 0 else EM_DASH
     return f"{int(scope_v)}{_PAIR_SEP}{right}"
 
 
-def _pair_fastest(scope_v: Optional[float], self_v: Optional[float]) -> str:
-    """Render a min-style stat (fastest goal). Smaller is better."""
+def _pair_fastest(scope_v: Optional[float], self_v: Optional[float], always_pair: bool = False) -> str:
+    """Render a min-style stat (fastest goal). Smaller is better.
+    See `_pair_max` for the `always_pair` flag."""
     if not scope_v:
         return EM_DASH
-    if self_v is not None and self_v <= scope_v:
+    if not always_pair and self_v is not None and self_v <= scope_v:
         return f"{scope_v:.1f}s"
     right = f"{self_v:.1f}s" if self_v else EM_DASH
     return f"{scope_v:.1f}s{_PAIR_SEP}{right}"
@@ -1596,24 +1602,24 @@ def render_summary_html(payload: dict, ms: "MatchStats") -> str:
 
     # PLAY rows: hide entirely when both match-wide and self are 0.
     play_rows = []
-    if ms.saves:     play_rows.append(_stat_row("Saves",     _pair_count(ms.saves, ms.saves_self)))
-    if ms.shots:     play_rows.append(_stat_row("Shots",     _pair_count(ms.shots, ms.shots_self)))
-    if ms.demos:     play_rows.append(_stat_row("Demos",     _pair_count(ms.demos, ms.demos_self)))
+    if ms.saves:     play_rows.append(_stat_row("Saves",     _pair_count(ms.saves, ms.saves_self, always_pair=True)))
+    if ms.shots:     play_rows.append(_stat_row("Shots",     _pair_count(ms.shots, ms.shots_self, always_pair=True)))
+    if ms.demos:     play_rows.append(_stat_row("Demos",     _pair_count(ms.demos, ms.demos_self, always_pair=True)))
     if ms.demoed_self:
         play_rows.append(_stat_row("Demoed",    str(ms.demoed_self)))
-    if ms.crossbars: play_rows.append(_stat_row("Crossbars", _pair_count(ms.crossbars, ms.crossbars_self)))
+    if ms.crossbars: play_rows.append(_stat_row("Crossbars", _pair_count(ms.crossbars, ms.crossbars_self, always_pair=True)))
 
     fun_rows = []
     if ms.max_goal_speed > 0:
-        fun_rows.append(_stat_row("Max goal speed",   _pair_max(ms.max_goal_speed, ms.max_goal_speed_self)))
+        fun_rows.append(_stat_row("Max goal speed",   _pair_max(ms.max_goal_speed, ms.max_goal_speed_self, always_pair=True)))
     if ms.max_ball_speed > 0:
-        fun_rows.append(_stat_row("Max ball speed",   _pair_max(ms.max_ball_speed, ms.max_ball_speed_self)))
+        fun_rows.append(_stat_row("Max ball speed",   _pair_max(ms.max_ball_speed, ms.max_ball_speed_self, always_pair=True)))
     if ms.max_impact_force > 0:
         fun_rows.append(_stat_row("Hardest crossbar",
-                                  _pair_max(ms.max_impact_force, ms.max_impact_force_self)))
+                                  _pair_max(ms.max_impact_force, ms.max_impact_force_self, always_pair=True)))
     if ms.fastest_goal_time is not None:
         fun_rows.append(_stat_row("Fastest goal",
-                                  _pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self)))
+                                  _pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self, always_pair=True)))
 
     body = ""
     if play_rows:
