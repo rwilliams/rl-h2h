@@ -17,7 +17,7 @@ _GRAPH_INSET_X = 4
 _GRAPH_CHIP_RADIUS = 4
 
 # Why module-level: render fires up to 4× per second from the focus_timer
-# while F12 is held; recreating QFonts each tick allocates needlessly.
+# while the session hotkey is held; recreating QFonts each tick allocates needlessly.
 _GRAPH_MONO_FAMILIES = ["Consolas", "SF Mono", "DejaVu Sans Mono", "Menlo", "Courier New"]
 _GRAPH_FONT_CACHE: dict[tuple, QFont] = {}
 

@@ -87,19 +87,19 @@ The overlay is **held**, not toggled. Defaults match Rocket League's stock score
 | Action                                             | PC      | Xbox    | PlayStation |
 |----------------------------------------------------|---------|---------|-------------|
 | Head-to-head                                       | **Tab** | **LB**  | **L1**      |
-| Session stats / MMR graph                          | **F12** | —       | —           |
-| Toggle expanded H2H *or* swap session ↔ graph      | **F11** | —       | —           |
-| Cycle MMR category *or* graph playlist             | **F10** | —       | —           |
+| Session stats / MMR graph                          | **F8**  | —       | —           |
+| Toggle expanded H2H *or* swap session ↔ graph      | **F7**  | —       | —           |
+| Cycle MMR category *or* graph playlist             | **F6**  | —       | —           |
 
 Hold to show; release to hide. Multiple bindings can be combined; the overlay shows while *any* of them is held.
 
-**F11** is context-sensitive:
+**F7** is context-sensitive:
 - While **Tab** is held (or nothing is held): toggles whether the H2H card also shows the session stats below. The choice persists across launches.
-- While **F12** is held: swaps the session card to a **MMR graph** view of your last 30 ranked matches for the selected playlist, with W/L markers, faint rank-zone bands behind the line, and your net MMR delta over the visible window. Same key, second press → back to the session card.
+- While **F8** is held: swaps the session card to a **MMR graph** view of your last 30 ranked matches for the selected playlist, with W/L markers, faint rank-zone bands behind the line, and your net MMR delta over the visible window. Same key, second press → back to the session card.
 
-**F10** is also context-sensitive:
+**F6** is also context-sensitive:
 - In the **H2H card**: cycles the MMR category shown next to each opponent — `best → 1v1 → 2v2 → 3v3 → best`. Active category appears in the H2H header (`MMR · BEST`) and the footer hint. Only does anything if MMR display is enabled — see below.
-- In the **graph view** (F12 held + graph open): cycles the plotted playlist — `1v1 → 2v2 → 3v3`. Active playlist shows in the graph header (`MMR · 2V2`).
+- In the **graph view** (F8 held + graph open): cycles the plotted playlist — `1v1 → 2v2 → 3v3`. Active playlist shows in the graph header (`MMR · 2V2`).
 
 Both choices persist independently across launches.
 
@@ -107,7 +107,7 @@ Both choices persist independently across launches.
 
 Right-click the tray icon and tick **"Show MMR (sends opponent IDs to tracker.gg)"**. Off by default. Once on, every opponent's rank tier and current MMR appear under their W/L line, color-coded by rank (bronze → SSL).
 
-Defaults to "best" — the highest MMR across the three competitive playlists (1v1, 2v2, 3v3) — with a small playlist hint so you can see *which* playlist that came from. Cycle to a specific playlist with **F10**.
+Defaults to "best" — the highest MMR across the three competitive playlists (1v1, 2v2, 3v3) — with a small playlist hint so you can see *which* playlist that came from. Cycle to a specific playlist with **F6**.
 
 - **Source**: `rocketleague.tracker.network`'s public JSON endpoint. No API key required.
 - **Privacy**: opponents' display names (and your own, until you exclude yourself) are sent over HTTPS to `api.tracker.gg`. The local match history, players, and config are never uploaded. Toggle off any time and the network calls stop immediately.
@@ -138,7 +138,7 @@ Settings live in `data/config.json` (created on first run). The `data/` folder i
 - `require_rl_focus` — set to `false` to also show the overlay on the desktop
 - `self_player_id` — auto-filled after your first 1v1; set manually if you only play 2v2/3v3 (copy your `Platform|Uid` from `data/players.json`)
 - `mmr_enabled` — `true` enables opponent MMR lookup against tracker.network. Off by default; flip via the tray menu so you see the privacy note.
-- `mmr_category` — `"best" | "1v1" | "2v2" | "3v3"`. Cycled live with **F10**.
+- `mmr_category` — `"best" | "1v1" | "2v2" | "3v3"`. Cycled live with **F6**.
 
 To wipe your match history, delete `data/matches.jsonl` and `data/players.json`. To wipe the MMR graph data, delete `data/mmr_history.jsonl`.
 

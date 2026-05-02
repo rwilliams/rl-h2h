@@ -298,7 +298,7 @@ def render_html(roster: list[dict], my_team: int, arena: str,
 
     arena_label = pretty_arena(arena)
     # When MMR is enabled, the right cell shows the active category pill
-    # ("MMR · BEST", "MMR · 2V2") so the user always sees what F10 is set to.
+    # ("MMR · BEST", "MMR · 2V2") so the user always sees what the cycle key is set to.
     # We show arena on a second header row so neither piece of info is lost.
     if mmr_enabled:
         cat = (mmr_category or "best").upper()
@@ -354,8 +354,8 @@ def render_html(roster: list[dict], my_team: int, arena: str,
 
 def session_footer_html(cfg: dict, view: str) -> str:
     """Hotkey hint row for the session card. View-specific copy: the session
-    view advertises F11 to swap to graph; the graph view doesn't reach here
-    because it's painted onto a pixmap, not HTML."""
+    view advertises the expand key to swap to graph; the graph view doesn't
+    reach here because it's painted onto a pixmap, not HTML."""
     expand_label = first_keyboard_label(cfg.get("expand_hotkeys") or [])
     if view != "session" or not expand_label:
         return ""
@@ -377,9 +377,9 @@ def session_footer_html(cfg: dict, view: str) -> str:
 def h2h_footer_html(cfg: dict, expanded: bool, session) -> str:
     """Single-table footer for the H2H overlay.
 
-    - Always: hotkey hint row (`F11 expand` left, `F12 session` right).
-    - When MMR is enabled: a second hotkey row with `F10 cycle MMR` and the
-      current category (e.g. "best", "2v2") so the user sees what's selected.
+    - Always: hotkey hint row (expand-key left, session-key right).
+    - When MMR is enabled: a second hotkey row with the cycle key + current
+      category (e.g. "best", "2v2") so the user sees what's selected.
     - When `session` is supplied AND has a split: a `Format | session | yours` row.
 
     Rows live in the same <table>, so Qt RichText doesn't insert its native
