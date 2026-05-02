@@ -546,7 +546,10 @@ MMR_TIER_COLORS = {
 }
 
 MMR_TTL_SECONDS = 600   # local cache freshness — TRN's own TTL is 4 min
-MMR_FETCH_INTERVAL = 2.0   # min seconds between outbound TRN requests
+# Min seconds between outbound TRN requests. TRN's median latency is ~500ms,
+# so this floor only kicks in on fast responses — effectively caps us at 2
+# req/sec without ever burst-blasting. A 6-player roster resolves in ~3s.
+MMR_FETCH_INTERVAL = 0.5
 
 # Cap log size at ~256 KB so it doesn't grow forever in long-running sessions.
 # We rotate by truncating once we cross the cap — last write wins, no archive.

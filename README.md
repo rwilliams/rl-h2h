@@ -112,7 +112,7 @@ Defaults to "best" — the highest MMR across the three competitive playlists (1
 - **Source**: `rocketleague.tracker.network`'s public JSON endpoint. No API key required.
 - **Privacy**: opponents' display names (and your own, until you exclude yourself) are sent over HTTPS to `api.tracker.gg`. The local match history, players, and config are never uploaded. Toggle off any time and the network calls stop immediately.
 - **Freshness**: tracker.network refreshes from Psyonix on demand and caches each profile for ~4 minutes server-side. We cache for 10 minutes locally (`mmr_cache.json`). MMR updates between matches with up to ~4 min lag, typically near-realtime.
-- **Throttle**: at most one outbound request every 2 seconds. A full 3v3 lobby's MMR resolves in under 6s.
+- **Throttle**: at most one outbound request every 0.5 seconds (≈ 2 req/sec). A full 3v3 lobby resolves in ~3s.
 - **Lookup limit**: the tracker indexes by display name. If a console player has just renamed (or has a name that's not unique), they'll show as `—`. Epic, PSN, Xbox, Switch, Steam are all supported in principle, but coverage depends on whether the player is registered on tracker.network.
 
 ### Tracking your own MMR over time
