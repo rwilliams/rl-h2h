@@ -82,12 +82,7 @@ class SessionStats:
                         self.fastest_goal_time_self = float(gt)
         elif event == EVT_CROSSBAR_HIT:
             self.crossbars += 1
-            last_touch = data.get("BallLastTouch")
-            toucher_name = None
-            if isinstance(last_touch, dict):
-                p = last_touch.get("Player")
-                if isinstance(p, dict):
-                    toucher_name = p.get("Name")
+            toucher_name, _ = last_touch_player(data)
             ifo = data.get("ImpactForce")
             if isinstance(ifo, (int, float)):
                 if ifo > self.max_impact_force:
@@ -205,12 +200,7 @@ class MatchStats:
                     self.max_ball_speed_self = max(self.max_ball_speed_self, float(sp))
         elif event == EVT_CROSSBAR_HIT:
             self.crossbars += 1
-            last_touch = data.get("BallLastTouch")
-            toucher = None
-            if isinstance(last_touch, dict):
-                player = last_touch.get("Player")
-                if isinstance(player, dict):
-                    toucher = player.get("Name")
+            toucher, _ = last_touch_player(data)
             if self._is_self(toucher):
                 self.crossbars_self += 1
             ifo = data.get("ImpactForce")

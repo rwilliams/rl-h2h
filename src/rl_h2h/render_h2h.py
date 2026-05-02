@@ -8,6 +8,7 @@ from . import colors
 from .arenas import pretty_arena
 from .constants import BUCKET_VS, BUCKET_WITH
 from .mmr import tier_color
+from .session_stats import session_has_split
 
 
 def first_keyboard_label(keys: list) -> Optional[str]:
@@ -386,8 +387,6 @@ def h2h_footer_html(cfg: dict, expanded: bool, session) -> str:
     Rows live in the same <table>, so Qt RichText doesn't insert its native
     ~12-20px between-block margin between them.
     """
-    from .session_stats import session_has_split  # local import: avoids cycle
-
     expand_label = first_keyboard_label(cfg.get("expand_hotkeys") or [])
     session_label = first_keyboard_label(cfg.get("session_hotkeys") or [])
     cycle_label = first_keyboard_label(cfg.get("cycle_hotkeys") or [])

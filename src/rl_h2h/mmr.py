@@ -44,6 +44,7 @@ MMR_PLAYLIST_IDS = {
     13: "3v3",
 }
 MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3")
+RANKED_PLAYLISTS = ("1v1", "2v2", "3v3")  # cycled by F10 in graph view; iterated for self-MMR logging
 
 # Standard RL rank colors. Tier strings come from TRN as "Bronze I", "Diamond III",
 # "Grand Champion II", etc. — we match on the prefix word.
@@ -381,7 +382,7 @@ class MMRClient(QObject):
         pl = entry.get("playlists") or {}
         pl_str = " ".join(
             f"{lbl}={(pl.get(lbl) or {}).get('mmr', '—')}"
-            for lbl in ("1v1", "2v2", "3v3")
+            for lbl in RANKED_PLAYLISTS
         )
         mmr_log(f"  {key!r} OK handle={entry.get('handle')!r} {pl_str} "
                 f"best={best.get('mmr')}@{best.get('playlist')} "

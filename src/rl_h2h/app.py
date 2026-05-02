@@ -15,7 +15,7 @@ from . import colors
 from .applog import mmr_log
 from .config import load_config, save_config
 from .hotkey import HotkeyManager, is_rl_focused
-from .mmr import MMR_CATEGORIES, MMRClient, append_mmr_history, load_mmr_history
+from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history, load_mmr_history
 from .overlay import Overlay
 from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
 from .render_h2h import h2h_footer_html, idle_html, render_html, session_footer_html
@@ -82,7 +82,7 @@ def main():
     }
     if state["session_view"] not in ("session", "graph"):
         state["session_view"] = "session"
-    if state["graph_playlist"] not in ("1v1", "2v2", "3v3"):
+    if state["graph_playlist"] not in RANKED_PLAYLISTS:
         state["graph_playlist"] = "2v2"
 
     def _any_visible() -> bool:
@@ -419,9 +419,6 @@ def main():
 
     hotkey_expand.pressed.connect(toggle_expand)
 
-
-    GRAPH_PLAYLISTS = ("1v1", "2v2", "3v3")
-
     def cycle_mmr_category():
         # Context-sensitive: while the graph view is showing (F12 held +
         # session_view=="graph"), F10 cycles the graph's playlist instead of
@@ -429,8 +426,8 @@ def main():
         # idea as F11 (expand H2H vs swap session subview).
         if state["session_held"] and state["session_view"] == "graph":
             cur_pl = state["graph_playlist"]
-            i = GRAPH_PLAYLISTS.index(cur_pl) if cur_pl in GRAPH_PLAYLISTS else -1
-            nxt_pl = GRAPH_PLAYLISTS[(i + 1) % len(GRAPH_PLAYLISTS)]
+            i = RANKED_PLAYLISTS.index(cur_pl) if cur_pl in RANKED_PLAYLISTS else -1
+            nxt_pl = RANKED_PLAYLISTS[(i + 1) % len(RANKED_PLAYLISTS)]
             state["graph_playlist"] = nxt_pl
             cfg["graph_playlist"] = nxt_pl
             save_config(cfg)
@@ -477,7 +474,7 @@ def main():
 
         any_change = any(
             (cur.get(lbl) or {}).get("mmr") != (prev.get(lbl) or {}).get("mmr")
-            for lbl in ("1v1", "2v2", "3v3")
+            for lbl in RANKED_PLAYLISTS
         )
         trn_rolled = last_updated != last_self_log["lastUpdated"]
         first_entry = not last_self_log["lastUpdated"]
@@ -485,7 +482,7 @@ def main():
             return  # static cache hit; saying so over and over is just noise
 
         parts = []
-        for label in ("1v1", "2v2", "3v3"):
+        for label in RANKED_PLAYLISTS:
             cv = (cur.get(label) or {}).get("mmr")
             pv = (prev.get(label) or {}).get("mmr")
             if cv is None:
@@ -521,7 +518,7 @@ def main():
                 "trn_lastUpdated": last_updated,
                 "playlists": {
                     lbl: (cur.get(lbl) or {}).get("mmr")
-                    for lbl in ("1v1", "2v2", "3v3")
+                    for lbl in RANKED_PLAYLISTS
                     if (cur.get(lbl) or {}).get("mmr") is not None
                 },
             }
