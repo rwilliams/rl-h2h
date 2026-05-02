@@ -7,7 +7,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
@@ -39,6 +39,16 @@ def main():
         with contextlib.suppress(Exception):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    # Single-instance guard. Two processes racing on data/*.json.tmp produces
+    # WinError 32 (file in use) on every save — keep one launch authoritative.
+    # QLockFile auto-cleans stale locks if the previous process crashed.
+    instance_lock = QLockFile(str(DATA_DIR / ".rl-h2h.lock"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        print("[singleton] another rl-h2h instance is already running; exiting.",
+              file=sys.stderr)
+        return
 
     cfg = load_config()
     colors.apply_overrides(cfg)
