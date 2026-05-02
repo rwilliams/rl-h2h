@@ -36,6 +36,8 @@ MMR_CACHE_PATH = APP_DIR / "mmr_cache.json"
 MMR_LOG_PATH = APP_DIR / "mmr.log"
 MY_MMR_LOG_PATH = APP_DIR / "my_mmr.log"
 MMR_HISTORY_PATH = APP_DIR / "mmr_history.jsonl"
+API_DUMP_PATH = APP_DIR / "api_dump.log"
+API_DUMP_CAP_BYTES = 2 * 1024 * 1024  # 2 MB; truncate-rotate when exceeded
 
 
 EVT_MATCH_CREATED = "MatchCreated"
@@ -208,6 +210,9 @@ DEFAULT_CONFIG = {
         "auto_update:           when true, start.bat checks GitHub for a newer version and",
         "                       updates silently before launching the app. Off by default;",
         "                       enable via the tray menu (right-click the H icon).",
+        "api_debug_dump:        when true, append every received Stats API envelope to",
+        "                       api_dump.log (capped at 2 MB, truncate-rotates). Diagnostic",
+        "                       only — leave off in normal use. Toggle via the tray menu.",
         "position: top-left | top-center | top-right | bottom-left | bottom-right",
         "colors: override any overlay color (hex strings). All keys are optional.",
         "  win:   positive accent (wins, +diffs, your YOU tag, recent W pips)",
@@ -232,6 +237,7 @@ DEFAULT_CONFIG = {
     "graph_match_window": 30,
     "graph_match_grace_seconds": 120,
     "auto_update": False,
+    "api_debug_dump": False,
     "require_rl_focus": True,
     "show_match_summary": True,
     "match_summary_seconds": 30,
@@ -566,6 +572,27 @@ def mmr_log(msg: str) -> None:
         pass
 
 
+_api_dump_lock = threading.Lock()
+
+
+def api_dump(event: str, data: dict) -> None:
+    """Append one envelope as a JSON line to api_dump.log. Truncate-rotates
+    when the file exceeds API_DUMP_CAP_BYTES. Diagnostic-only — failures are
+    swallowed because a debug dump must never crash the parser."""
+    try:
+        line = json.dumps({"ts": now_iso(), "Event": event, "Data": data})
+    except (TypeError, ValueError):
+        return
+    try:
+        with _api_dump_lock:
+            if API_DUMP_PATH.exists() and API_DUMP_PATH.stat().st_size > API_DUMP_CAP_BYTES:
+                API_DUMP_PATH.write_text("", encoding="utf-8")
+            with API_DUMP_PATH.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
     """(trn_platform_slug, display_name) for a wire identity, or None if
     unsupported. TRN's lookup endpoint requires display name on every platform
@@ -872,13 +899,15 @@ class StatsClient(QObject):
     connection_status = Signal(bool)
     event_seen = Signal(str, dict)  # raw event name + decoded data, for downstream consumers
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, api_dump_enabled: bool = False):
         super().__init__()
         self.host = host
         self.port = port
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="StatsClient")
+        self._api_dump_enabled = bool(api_dump_enabled)
+        self._update_state_count_this_match = 0
         self._reset()
 
     def _reset(self):
@@ -893,6 +922,10 @@ class StatsClient(QObject):
         self._score: list[int] = [0, 0]
         self._team_colors: dict[int, str] = {}
         self._in_replay = False
+        self._update_state_count_this_match = 0
+
+    def set_api_dump(self, on: bool) -> None:
+        self._api_dump_enabled = bool(on)
 
     def start(self):
         self._thread.start()
@@ -971,6 +1004,23 @@ class StatsClient(QObject):
         if not isinstance(msg, dict):
             return
         event = msg.get("Event", "?")
+        if self._api_dump_enabled:
+            # Decode the double-encoded Data payload up-front so the dump shows
+            # the unwrapped envelope. Mirrors the decoding done in _handle.
+            raw_data = msg.get("Data")
+            if isinstance(raw_data, str):
+                try:
+                    decoded = json.loads(raw_data) if raw_data else {}
+                except json.JSONDecodeError:
+                    decoded = raw_data
+            else:
+                decoded = raw_data if raw_data is not None else {}
+            if event == EVT_UPDATE_STATE:
+                if self._update_state_count_this_match < 3:
+                    api_dump(event, decoded)
+                    self._update_state_count_this_match += 1
+            else:
+                api_dump(event, decoded)
         try:
             self._handle(msg)
         except Exception as e:
@@ -2781,7 +2831,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     overlay = Overlay(cfg)
-    stats = StatsClient(cfg["host"], cfg["port"])
+    stats = StatsClient(cfg["host"], cfg["port"],
+                        api_dump_enabled=bool(cfg.get("api_debug_dump", False)))
     session = SessionStats(recent_size=cfg.get("recent_size", 5))
     match_stats = MatchStats()
     mmr_client = MMRClient(enabled=bool(cfg.get("mmr_enabled", False)))
@@ -3399,6 +3450,17 @@ def main():
             print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
         auto_update_action.toggled.connect(_toggle_auto_update)
         menu.addAction(auto_update_action)
+
+        api_dump_action = QAction("Dump raw API to api_dump.log (debug)")
+        api_dump_action.setCheckable(True)
+        api_dump_action.setChecked(bool(cfg.get("api_debug_dump", False)))
+        def _toggle_api_dump(checked: bool):
+            cfg["api_debug_dump"] = bool(checked)
+            save_config(cfg)
+            stats.set_api_dump(bool(checked))
+            print(f"[stats] api_debug_dump={cfg['api_debug_dump']}", file=sys.stderr)
+        api_dump_action.toggled.connect(_toggle_api_dump)
+        menu.addAction(api_dump_action)
         menu.addSeparator()
 
         quit_action = QAction("Quit")
