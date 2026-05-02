@@ -244,6 +244,157 @@ class HotkeyManager(QObject):
         self._pad_stop.set()
 
 
+# Windows virtual-key codes for menu navigation. Used by MenuHotkeyListener
+# to identify keys inside the low-level keyboard hook (where we get a vk_code,
+# not a pynput Key object).
+_VK_BY_NAME: dict[str, int] = {
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "enter": 0x0D, "esc": 0x1B, "tab": 0x09, "space": 0x20,
+    "backspace": 0x08, "insert": 0x2D, "delete": 0x2E,
+    "home": 0x24, "end": 0x23, "page_up": 0x21, "page_down": 0x22,
+    "shift": 0x10, "ctrl": 0x11, "alt": 0x12, "caps_lock": 0x14,
+    **{f"f{i}": 0x6F + i for i in range(1, 13)},  # F1=0x70..F12=0x7B
+}
+
+
+def _name_to_vk(name: Optional[str]) -> Optional[int]:
+    """Config-style binding name → Windows virtual-key code, or None for
+    pad bindings / unknowns. Single-char keys map by ord(uppercase)."""
+    if not name:
+        return None
+    n = name.strip().lower()
+    if n.startswith("pad_"):
+        return None
+    if n in _VK_BY_NAME:
+        return _VK_BY_NAME[n]
+    if len(n) == 1:
+        return ord(n.upper())
+    return None
+
+
+class MenuHotkeyListener(QObject):
+    """Keyboard listener for the in-game settings menu.
+
+    On Windows, uses pynput's ``win32_event_filter`` to selectively suppress
+    the menu key (always, when menu isn't capturing) and the nav keys
+    (↑/↓/Enter, only while the menu is open and not in rebind capture). The
+    suppression prevents Rocket League from also reacting to those presses
+    — without it, Enter would also trigger RL's UI confirm, etc.
+
+    On non-Windows platforms there's no suppression hook in pynput's stable
+    API; we fall back to a regular listener that dispatches signals but lets
+    keys pass through to the foreground app. Suppression matters for
+    in-game use (Windows-only), so the macOS dev path is fine.
+    """
+
+    toggle = Signal()
+    up = Signal()
+    down = Signal()
+    enter = Signal()
+
+    # Windows hook message types. We only emit on key-down (and only on the
+    # down-edge — the LL hook receives auto-repeat WM_KEYDOWN events too,
+    # which would otherwise flicker the menu open/closed on a held key).
+    _WM_KEYDOWN = 0x0100
+    _WM_KEYUP = 0x0101
+    _WM_SYSKEYDOWN = 0x0104
+    _WM_SYSKEYUP = 0x0105
+
+    def __init__(self, menu_key_cb, is_visible_cb, is_capturing_cb):
+        super().__init__()
+        self._menu_key_cb = menu_key_cb
+        self._is_visible_cb = is_visible_cb
+        self._is_capturing_cb = is_capturing_cb
+        self._held: set[int] = set()
+        if sys.platform == "win32":
+            self._listener = keyboard.Listener(
+                on_press=lambda k: None,
+                on_release=lambda k: None,
+                win32_event_filter=self._win32_filter,
+            )
+        else:
+            self._listener = keyboard.Listener(on_press=self._on_press_generic)
+
+    def start(self) -> None:
+        self._listener.start()
+
+    def stop(self) -> None:
+        self._listener.stop()
+
+    @staticmethod
+    def _vk_of(data) -> int:
+        """Read vkCode out of pynput's KBDLLHOOKSTRUCT (field name varies
+        across pynput versions: vk_code in modern, vkCode in older)."""
+        return getattr(data, "vk_code", None) or getattr(data, "vkCode", 0)
+
+    def _win32_filter(self, msg, data) -> bool:
+        vk = self._vk_of(data)
+        if msg in (self._WM_KEYUP, self._WM_SYSKEYUP):
+            self._held.discard(vk)
+            return True
+        if msg not in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN):
+            return True
+        # Down-edge only: the LL hook fires WM_KEYDOWN for every auto-repeat.
+        if vk in self._held:
+            # Still suppress repeats for keys we'd suppress on the down-edge,
+            # otherwise RL would see only the repeats.
+            menu_vk_now = _name_to_vk(self._menu_key_cb())
+            if vk == menu_vk_now and not self._is_capturing_cb():
+                return False
+            if self._is_visible_cb() and not self._is_capturing_cb() and vk in (
+                _VK_BY_NAME["up"], _VK_BY_NAME["down"], _VK_BY_NAME["enter"],
+            ):
+                return False
+            return True
+        self._held.add(vk)
+        capturing = self._is_capturing_cb()
+        visible = self._is_visible_cb()
+        menu_vk = _name_to_vk(self._menu_key_cb())
+
+        if menu_vk is not None and vk == menu_vk:
+            # During capture, the menu key is being captured as a new
+            # binding — let it propagate so capture_next_input's listener
+            # sees it and so the user gets a chance to cancel via Esc.
+            if capturing:
+                return True
+            self.toggle.emit()
+            return False  # suppress so RL doesn't also see the press
+
+        if not visible or capturing:
+            return True
+
+        if vk == _VK_BY_NAME["up"]:
+            self.up.emit()
+            return False
+        if vk == _VK_BY_NAME["down"]:
+            self.down.emit()
+            return False
+        if vk == _VK_BY_NAME["enter"]:
+            self.enter.emit()
+            return False
+        return True
+
+    def _on_press_generic(self, key) -> None:
+        # Non-Windows fallback: dispatch but don't suppress.
+        name = _kb_event_name(key)
+        if name is None:
+            return
+        capturing = self._is_capturing_cb()
+        if name == (self._menu_key_cb() or "f5"):
+            if capturing:
+                return
+            self.toggle.emit()
+            return
+        if not self._is_visible_cb() or capturing:
+            return
+        if name == "up":
+            self.up.emit()
+        elif name == "down":
+            self.down.emit()
+        elif name == "enter":
+            self.enter.emit()
+
+
 def _kb_event_name(key) -> Optional[str]:
     """pynput key → config-style binding name. None for unbindable events
     (modifier-only releases, dead keys)."""

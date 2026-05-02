@@ -361,7 +361,8 @@ def _pretty_binding(name: Optional[str]) -> str:
     return name.upper()
 
 
-def render_menu_html(rows: list[dict], selected_index: int, capturing: bool) -> str:
+def render_menu_html(rows: list[dict], selected_index: int, capturing: bool,
+                     menu_key: str = "f5") -> str:
     """In-game settings menu. Hotkey-driven (overlay is input-transparent),
     so this renders a static panel — selection cursor + values only.
 
@@ -420,10 +421,11 @@ def render_menu_html(rows: list[dict], selected_index: int, capturing: bool) -> 
                 "</tr>"
             )
 
+    close_label = _pretty_binding(menu_key)
     footer_text = (
         "Press a key or gamepad button&hellip; (Esc to cancel)"
         if capturing else
-        "&uarr;&darr; move &middot; Enter select &middot; F5/Esc close"
+        f"&uarr;&darr; move &middot; Enter select &middot; {close_label} close"
     )
 
     return (

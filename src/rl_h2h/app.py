@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 from . import colors
 from .applog import mmr_log
 from .config import load_config, save_config
-from .hotkey import HotkeyManager, capture_next_input, is_rl_focused
+from .hotkey import HotkeyManager, MenuHotkeyListener, capture_next_input, is_rl_focused
 from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history, load_mmr_history
 from .overlay import Overlay
 from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
@@ -71,10 +71,13 @@ def main():
     hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
     # In-game settings menu: F5 toggles, arrows navigate, Enter selects.
     # Esc only matters during rebind capture (handled inside capture_next_input).
-    hotkey_menu_toggle = HotkeyManager([cfg.get("menu_hotkey") or "f5"])
-    hotkey_menu_up = HotkeyManager(["up"])
-    hotkey_menu_down = HotkeyManager(["down"])
-    hotkey_menu_enter = HotkeyManager(["enter"])
+    # MenuHotkeyListener suppresses these keys (Windows) so they don't also
+    # reach Rocket League's menu while ours is open.
+    hotkey_menu = MenuHotkeyListener(
+        menu_key_cb=lambda: cfg.get("menu_hotkey") or "f5",
+        is_visible_cb=lambda: state["menu_visible"],
+        is_capturing_cb=lambda: state["menu_capture"] is not None,
+    )
 
     # Sanitize the persisted category once at startup — guards against a hand-edited
     # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
@@ -116,6 +119,7 @@ def main():
         if state["menu_visible"]:
             overlay.set_html(render_menu_html(
                 _menu_rows(), state["menu_index"], state["menu_capture"] is not None,
+                menu_key=cfg.get("menu_hotkey") or "f5",
             ))
             overlay.show()
             overlay.raise_()
@@ -626,7 +630,8 @@ def main():
                 return
             cfg["menu_hotkey"] = name
             save_config(cfg)
-            hotkey_menu_toggle.set_bindings([name])
+            # MenuHotkeyListener reads cfg via its menu_key_cb on each event,
+            # so the new key is picked up on the next press without a restart.
             mmr_log(f"menu rebind: menu_hotkey = {name!r}")
             update_overlay()
             return
@@ -671,10 +676,10 @@ def main():
             update_overlay()  # show the "press…" hint
             capture_next_input(lambda n: capture_bridge.captured.emit(n))
 
-    hotkey_menu_toggle.pressed.connect(on_menu_toggle)
-    hotkey_menu_up.pressed.connect(on_menu_up)
-    hotkey_menu_down.pressed.connect(on_menu_down)
-    hotkey_menu_enter.pressed.connect(on_menu_enter)
+    hotkey_menu.toggle.connect(on_menu_toggle)
+    hotkey_menu.up.connect(on_menu_up)
+    hotkey_menu.down.connect(on_menu_down)
+    hotkey_menu.enter.connect(on_menu_enter)
     # ── End settings menu ────────────────────────────────────────────────────
 
     # Tracks the last self entry we logged so we can compute deltas (and skip
@@ -912,10 +917,7 @@ def main():
     hotkey_session.start()
     hotkey_expand.start()
     hotkey_cycle.start()
-    hotkey_menu_toggle.start()
-    hotkey_menu_up.start()
-    hotkey_menu_down.start()
-    hotkey_menu_enter.start()
+    hotkey_menu.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
           f"expand={cfg.get('expand_hotkeys') or []} "
@@ -935,9 +937,6 @@ def main():
     hotkey_session.stop()
     hotkey_expand.stop()
     hotkey_cycle.stop()
-    hotkey_menu_toggle.stop()
-    hotkey_menu_up.stop()
-    hotkey_menu_down.stop()
-    hotkey_menu_enter.stop()
+    hotkey_menu.stop()
     mmr_client.stop()
     sys.exit(rc)
