@@ -548,6 +548,11 @@ def main():
                      "toggle_key": "auto_update"})
         rows.append({"type": "spacer"})
         rows.append({"type": "header", "label": "BINDINGS"})
+        # Menu key first so it's findable even if someone rebinds it to
+        # something obscure and then forgets.
+        rows.append({"type": "binding", "label": "Menu (this)",
+                     "kb": cfg.get("menu_hotkey") or "f5", "pad": None,
+                     "action_key": "menu_hotkey"})
         for cfg_key, label, _mgr in rebindable:
             kb, pad = _split_bindings(cfg.get(cfg_key) or [])
             rows.append({"type": "binding", "label": label,
@@ -611,8 +616,22 @@ def main():
             mmr_log(f"menu rebind cancelled for {action_key!r}")
             update_overlay()
             return
-        # Don't let users rebind to the menu hotkey itself — they'd lose the
-        # only way back into the menu.
+        # Rebinding the menu hotkey itself: stored as a single string and
+        # keyboard-only (a gamepad button would open the menu mid-game by
+        # accident way too often).
+        if action_key == "menu_hotkey":
+            if name.startswith("pad_"):
+                mmr_log(f"menu rebind ignored: {name!r} (menu key must be keyboard)")
+                update_overlay()
+                return
+            cfg["menu_hotkey"] = name
+            save_config(cfg)
+            hotkey_menu_toggle.set_bindings([name])
+            mmr_log(f"menu rebind: menu_hotkey = {name!r}")
+            update_overlay()
+            return
+        # Other actions: don't let them shadow the menu hotkey, or you lose
+        # the only way back into the menu.
         if name == (cfg.get("menu_hotkey") or "f5"):
             mmr_log(f"menu rebind ignored: {name!r} is the menu hotkey")
             update_overlay()
