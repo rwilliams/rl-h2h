@@ -13,7 +13,7 @@ from .session_stats import (
 
 
 def render_match_stats_html(ms: MatchStats) -> str:
-    """Body-only render of per-match stats (PLAY / ACTIVITY / FUN sections).
+    """Body-only render of per-match stats (PLAY / FUN sections).
 
     Used both by the auto-popup match summary and by the in-game expanded H2H
     overlay so the same numbers show in both places. Returns an empty string
@@ -26,13 +26,6 @@ def render_match_stats_html(ms: MatchStats) -> str:
     if ms.demoed_self:
         play_rows.append(stat_row("Demoed",    str(ms.demoed_self)))
     if ms.crossbars: play_rows.append(stat_row("Crossbars", pair_count(ms.crossbars, ms.crossbars_self, always_pair=True)))
-
-    # ACTIVITY: derived from UpdateState ticks. Boost-used is summed from
-    # Boost-percentage drops at ~2 Hz, so prefix with ~ to flag the approximation.
-    activity_rows = []
-    b_scope, b_self = ms.boost_used_leader()
-    if b_scope:
-        activity_rows.append(stat_row("Boost used", f"~{b_scope}{colors.PAIR_SEP}~{b_self}"))
 
     fun_rows = []
     if ms.max_goal_speed > 0:
@@ -52,8 +45,6 @@ def render_match_stats_html(ms: MatchStats) -> str:
     body = ""
     if play_rows:
         body += stat_section("PLAY", play_rows)
-    if activity_rows:
-        body += stat_section("ACTIVITY", activity_rows)
     if fun_rows:
         body += stat_section("FUN", fun_rows)
     return body

@@ -11,7 +11,6 @@ from .constants import (
     EVT_CROSSBAR_HIT,
     EVT_GOAL_SCORED,
     EVT_STATFEED,
-    EVT_UPDATE_STATE,
     SF_DEMOLISH,
     SF_SAVE,
     SF_SHOT,
@@ -164,9 +163,6 @@ class MatchStats:
         self.fastest_goal_time_self: Optional[float] = None
         self.own_goals = 0
         self.own_goals_self = 0
-        # Per-player boost-used, summed from Boost-percentage deltas across
-        # UpdateState ticks. Keyed by player Name.
-        self._players: dict[str, dict] = {}
 
     def _is_self(self, name) -> bool:
         return bool(name) and name == self.self_name
@@ -232,35 +228,6 @@ class MatchStats:
                     self.demos_self += 1
                 if self._is_self(sec_name):
                     self.demoed_self += 1
-        elif event == EVT_UPDATE_STATE:
-            self._absorb_update_state(data)
-
-    def _absorb_update_state(self, data: dict) -> None:
-        players = data.get("Players")
-        if not isinstance(players, list):
-            return
-        for p in players:
-            if not isinstance(p, dict):
-                continue
-            name = p.get("Name")
-            if not isinstance(name, str) or not name:
-                continue
-            b = p.get("Boost")
-            if not isinstance(b, (int, float)):
-                continue
-            st = self._players.setdefault(name, {"boost_used": 0.0, "last_boost": None})
-            last = st["last_boost"]
-            if last is not None and b < last:
-                st["boost_used"] += float(last - b)
-            st["last_boost"] = float(b)
-
-    def boost_used_leader(self) -> tuple[int, int]:
-        """Return (max boost used across players, self's boost used)."""
-        if not self._players:
-            return (0, 0)
-        scope = max(s["boost_used"] for s in self._players.values())
-        me = self._players.get(self.self_name) if self.self_name else None
-        return (int(scope), int(me["boost_used"]) if me else 0)
 
 
 # ---- Render helpers ---------------------------------------------------------
