@@ -212,7 +212,8 @@ DEFAULT_CONFIG = {
         "                       enable via the tray menu (right-click the H icon).",
         "api_debug_dump:        when true, append every received Stats API envelope to",
         "                       api_dump.log (capped at 2 MB, truncate-rotates). Diagnostic",
-        "                       only — leave off in normal use. Toggle via the tray menu.",
+        "                       only — leave off in normal use. Edit this file and restart",
+        "                       to toggle (no tray UI; intentionally not hot-pluggable).",
         "position: top-left | top-center | top-right | bottom-left | bottom-right",
         "colors: override any overlay color (hex strings). All keys are optional.",
         "  win:   positive accent (wins, +diffs, your YOU tag, recent W pips)",
@@ -923,9 +924,6 @@ class StatsClient(QObject):
         self._team_colors: dict[int, str] = {}
         self._in_replay = False
         self._update_state_count_this_match = 0
-
-    def set_api_dump(self, on: bool) -> None:
-        self._api_dump_enabled = bool(on)
 
     def start(self):
         self._thread.start()
@@ -2501,6 +2499,12 @@ def attribute_mmr_points(playlist: str, snapshots: list[dict],
                 interval_matches.append(m)
 
         if not interval_matches:
+            if delta == 0:
+                # Idle interval for this playlist — no MMR motion and no
+                # match in this mode. Skip; emitting a flat snap here is
+                # what made the graph draw a horizontal line across days
+                # of 2v2-only play when looking at the 3v3 graph.
+                continue
             # MMR moved without a recorded match — user played in another
             # session or outside our tracking. Plot the snapshot transition
             # only; no per-game line.
@@ -2666,6 +2670,8 @@ def render_graph_pixmap(playlist: str, snapshots: list[dict],
         elif not any((s.get("playlists") or {}).get(playlist) is not None
                      for s in snapshots):
             msg = f"No {playlist} MMR yet — play a ranked {playlist} match"
+        elif not any(_match_playlist(m) == playlist for m in matches):
+            msg = f"No {playlist} matches yet — play one to start the graph"
         else:
             msg = "Need at least 2 MMR snapshots — keep playing"
         fm = painter.fontMetrics()
@@ -3450,17 +3456,6 @@ def main():
             print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
         auto_update_action.toggled.connect(_toggle_auto_update)
         menu.addAction(auto_update_action)
-
-        api_dump_action = QAction("Dump raw API to api_dump.log (debug)")
-        api_dump_action.setCheckable(True)
-        api_dump_action.setChecked(bool(cfg.get("api_debug_dump", False)))
-        def _toggle_api_dump(checked: bool):
-            cfg["api_debug_dump"] = bool(checked)
-            save_config(cfg)
-            stats.set_api_dump(bool(checked))
-            print(f"[stats] api_debug_dump={cfg['api_debug_dump']}", file=sys.stderr)
-        api_dump_action.toggled.connect(_toggle_api_dump)
-        menu.addAction(api_dump_action)
         menu.addSeparator()
 
         quit_action = QAction("Quit")
