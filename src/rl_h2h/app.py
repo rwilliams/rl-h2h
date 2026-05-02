@@ -1,0 +1,729 @@
+"""Application entrypoint. Wires modules together and runs the Qt event loop."""
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+from PySide6.QtCore import QLockFile, QTimer
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+
+from . import colors
+from .applog import mmr_log
+from .config import load_config, save_config
+from .hotkey import HotkeyManager, is_rl_focused
+from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history, load_mmr_history
+from .overlay import Overlay
+from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
+from .render_h2h import h2h_footer_html, idle_html, render_html, session_footer_html
+from .render_summary import render_summary_html
+from .session_stats import MatchStats, SessionStats, render_session_html
+from .stats_client import StatsClient
+from .storage import (
+    append_match,
+    load_matches,
+    load_players,
+    playlist_from_player_count,
+    save_players,
+    update_players_cache,
+)
+from .tray import make_tray_icon
+from .graph import render_graph_pixmap
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        with contextlib.suppress(Exception):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    # Single-instance guard. Two processes racing on data/*.json.tmp produces
+    # WinError 32 (file in use) on every save — keep one launch authoritative.
+    # QLockFile auto-cleans stale locks if the previous process crashed.
+    instance_lock = QLockFile(str(DATA_DIR / ".rl-h2h.lock"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        print("[singleton] another rl-h2h instance is already running; exiting.",
+              file=sys.stderr)
+        return
+
+    cfg = load_config()
+    colors.apply_overrides(cfg)
+    players_db = load_players()
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    overlay = Overlay(cfg)
+    overlay.set_html(idle_html("Waiting for Rocket League…"))
+    stats = StatsClient(cfg["host"], cfg["port"],
+                        api_dump_enabled=bool(cfg.get("api_debug_dump", False)))
+    session = SessionStats(recent_size=cfg.get("recent_size", 5))
+    match_stats = MatchStats()
+    mmr_client = MMRClient(enabled=bool(cfg.get("mmr_enabled", False)))
+    mmr_client.start()
+    hotkey_h2h = HotkeyManager(cfg["hotkeys"])
+    hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
+    hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
+    hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
+
+    # Sanitize the persisted category once at startup — guards against a hand-edited
+    # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
+    if cfg.get("mmr_category") not in MMR_CATEGORIES:
+        cfg["mmr_category"] = "best"
+
+    state = {
+        "in_match": False,
+        "h2h_held": False,
+        "session_held": False,
+        "summary_visible": False,
+        "summary_html": "",
+        "h2h_html": idle_html("Waiting for Rocket League…"),
+        "h2h_expanded": bool(cfg.get("h2h_default_expanded", False)),
+        "session_view": cfg.get("session_view", "session"),
+        "graph_playlist": cfg.get("graph_playlist", "2v2"),
+        "roster": [],
+        "my_team": 0,
+        "arena": "",
+        "team_colors": {},
+    }
+    if state["session_view"] not in ("session", "graph"):
+        state["session_view"] = "session"
+    if state["graph_playlist"] not in RANKED_PLAYLISTS:
+        state["graph_playlist"] = "2v2"
+
+    def _any_visible() -> bool:
+        return (state["h2h_held"] or state["session_held"]
+                or state["summary_visible"])
+
+    def update_overlay():
+        if not _any_visible():
+            focus_timer.stop()
+            overlay.hide()
+            return
+        if cfg.get("require_rl_focus", True) and not is_rl_focused():
+            overlay.hide()
+            return
+        # Priority: held keys win over the auto-popup. Session > H2H > summary.
+        if state["session_held"]:
+            if state["session_view"] == "graph":
+                _ensure_graph_data_loaded()
+                pix = render_graph_pixmap(
+                    state["graph_playlist"],
+                    mmr_history_cache["snapshots"],
+                    mmr_history_cache["matches"],
+                    cfg,
+                    canvas_width=cfg["width"] - 32,
+                )
+                overlay.set_pixmap(pix)
+            else:
+                overlay.set_html(
+                    render_session_html(session)
+                    + session_footer_html(cfg, "session")
+                )
+        elif state["h2h_held"] and state["in_match"]:
+            if state["h2h_expanded"]:
+                spacer = (
+                    "<table cellpadding='0' cellspacing='0' width='100%'>"
+                    "<tr><td height='28'>&nbsp;</td></tr></table>"
+                )
+                # In expanded mode we render the session WITHOUT its own Format legend
+                # and recombine it (along with the hotkey hint) into a single-table
+                # footer below — that way the two metadata rows are siblings inside
+                # one table and Qt can't slip native block spacing between them.
+                overlay.set_html(
+                    state["h2h_html"]
+                    + spacer
+                    + render_session_html(session, with_legend=False)
+                    + h2h_footer_html(cfg, expanded=True, session=session)
+                )
+            else:
+                overlay.set_html(
+                    state["h2h_html"]
+                    + h2h_footer_html(cfg, expanded=False, session=None)
+                )
+        elif state["summary_visible"]:
+            overlay.set_html(state["summary_html"])
+        else:
+            overlay.hide()
+            return
+        overlay.show()
+        overlay.raise_()
+
+    focus_timer = QTimer()
+    focus_timer.setInterval(250)
+    focus_timer.timeout.connect(update_overlay)
+
+    def on_h2h_pressed():
+        state["h2h_held"] = True
+        focus_timer.start()
+        update_overlay()
+
+    def on_h2h_released():
+        state["h2h_held"] = False
+        if not _any_visible():
+            focus_timer.stop()
+        update_overlay()
+
+    def on_session_pressed():
+        state["session_held"] = True
+        focus_timer.start()
+        update_overlay()
+
+    def on_session_released():
+        state["session_held"] = False
+        if not _any_visible():
+            focus_timer.stop()
+        update_overlay()
+
+    summary_timer = QTimer()
+    summary_timer.setSingleShot(True)
+
+    def hide_summary():
+        summary_timer.stop()
+        state["summary_visible"] = False
+        if not _any_visible():
+            focus_timer.stop()
+        update_overlay()
+
+    summary_timer.timeout.connect(hide_summary)
+
+    def rerender_h2h() -> None:
+        """Re-run render_html against the saved roster — used both when a match
+        starts and whenever fresh MMR data lands or the user cycles category."""
+        if not state["roster"]:
+            mmr_log("rerender_h2h: skip (no roster)")
+            return
+        self_id = cfg.get("self_player_id")
+        # Snapshot the cache once per render so all rows see a consistent view
+        # even if the worker writes mid-build.
+        mmr_db = {p["key"]: mmr_client.get(p["key"]) for p in state["roster"]}
+        if mmr_client.is_enabled():
+            summary_parts = []
+            for p in state["roster"]:
+                e = mmr_db.get(p["key"])
+                if e is None:
+                    summary_parts.append(f"{p['name']}=…")
+                elif e.get("not_found"):
+                    summary_parts.append(f"{p['name']}=NF")
+                else:
+                    best = (e.get("best") or {})
+                    summary_parts.append(
+                        f"{p['name']}={best.get('mmr')}@{best.get('playlist')}"
+                    )
+            mmr_log(f"rerender_h2h: cat={cfg.get('mmr_category','best')!r} "
+                    f"rows=[{', '.join(summary_parts)}]")
+        state["h2h_html"] = render_html(
+            state["roster"], state["my_team"], state["arena"],
+            players_db, state["team_colors"], self_id,
+            mmr_db=mmr_db,
+            mmr_category=cfg.get("mmr_category", "best"),
+            mmr_enabled=mmr_client.is_enabled(),
+        )
+
+    def _ensure_graph_data_loaded() -> None:
+        """First call (or after `dirty` is set) parses the on-disk files into
+        the in-memory cache. Subsequent calls re-stat both files and reparse
+        only when their mtime changed — cheap, and means polling-loop writes
+        appear in the next graph render without extra plumbing."""
+        try:
+            hist_mtime = MMR_HISTORY_PATH.stat().st_mtime if MMR_HISTORY_PATH.exists() else 0.0
+        except OSError:
+            hist_mtime = 0.0
+        try:
+            match_mtime = MATCHES_PATH.stat().st_mtime if MATCHES_PATH.exists() else 0.0
+        except OSError:
+            match_mtime = 0.0
+        need_load = (
+            not mmr_history_cache["loaded"]
+            or mmr_history_cache["dirty"]
+            or hist_mtime != mmr_history_cache["mtime_history"]
+            or match_mtime != mmr_history_cache["mtime_matches"]
+        )
+        if not need_load:
+            return
+        mmr_history_cache["snapshots"] = load_mmr_history()
+        mmr_history_cache["matches"] = load_matches()
+        mmr_history_cache["mtime_history"] = hist_mtime
+        mmr_history_cache["mtime_matches"] = match_mtime
+        mmr_history_cache["loaded"] = True
+        mmr_history_cache["dirty"] = False
+
+    # Post-match self-MMR polling state. The token is bumped on each new poll
+    # so callbacks scheduled by an earlier poll can self-cancel — important
+    # because back-to-back matches would otherwise produce overlapping polls
+    # whose snapshots interleave in the attribution algorithm.
+    poll_state = {"token": 0, "baseline": None}
+
+    def start_post_match_mmr_poll(self_player: dict) -> None:
+        pid = self_player.get("primaryId") or self_player["key"]
+        name = self_player.get("name") or ""
+        self_id = cfg.get("self_player_id")
+        baseline_entry = mmr_client.get(self_id) if self_id else None
+        baseline = (baseline_entry or {}).get("lastUpdated") or ""
+
+        poll_state["token"] += 1
+        poll_state["baseline"] = baseline
+        my_token = poll_state["token"]
+        delays_ms = [0, 120_000, 240_000, 360_000, 480_000, 600_000]
+        mmr_log(f"poll: scheduled for self={self_id!r} "
+                f"baseline_lastUpdated={baseline!r}")
+
+        def attempt(i: int):
+            if poll_state["token"] != my_token:
+                mmr_log(f"poll: superseded (token {my_token} != "
+                        f"{poll_state['token']}); aborting")
+                return
+            cur = mmr_client.get(self_id) if self_id else None
+            cur_last = (cur or {}).get("lastUpdated") or ""
+            if cur_last and baseline and cur_last > baseline:
+                mmr_log(f"poll: TRN advanced to {cur_last!r} after {i} attempt(s); stopping")
+                return
+            if i >= len(delays_ms):
+                mmr_log("poll: budget exhausted (10 min, 6 attempts)")
+                return
+            mmr_log(f"poll: attempt #{i+1}/{len(delays_ms)} (force-refresh)")
+            mmr_client.enqueue(pid, name, force=True)
+            QTimer.singleShot(120_000, lambda: attempt(i + 1))
+
+        attempt(0)
+
+    def on_initialized(payload: dict):
+        state["in_match"] = True
+        hide_summary()  # next match starting → drop any in-flight post-match popup
+        # Auto-detect self in 1v1: only one teammate on my side = me. Persist to config.
+        if not cfg.get("self_player_id"):
+            mt = payload["myTeam"]
+            same_side = [p for p in payload["players"] if p["team"] == mt]
+            if len(same_side) == 1:
+                cfg["self_player_id"] = same_side[0]["key"]
+                print(f"[self] detected self={same_side[0]['name']!r} "
+                      f"({same_side[0]['key']}) — saved to config", file=sys.stderr)
+                save_config(cfg)
+        # Resolve self_name for session-stat attribution (events only carry Name).
+        self_id = cfg.get("self_player_id")
+        if self_id:
+            for p in payload["players"]:
+                if p["key"] == self_id:
+                    session.self_name = p["name"]
+                    break
+        # Reset per-match aggregator using the now-known self_name.
+        match_stats.reset(self_name=session.self_name)
+        # Persist roster bits we need to re-render asynchronously when MMR
+        # data trickles in (or when the user toggles category via F10).
+        state["roster"] = payload["players"]
+        state["my_team"] = payload["myTeam"]
+        state["arena"] = payload["arena"]
+        state["team_colors"] = payload.get("teamColors") or {}
+        # Self IS included now — we want to see our own MMR in the YOU row,
+        # and the post-match refresh in on_ended only works if self has been
+        # enqueued at least once. Cached entries serve instantly, fresh ones
+        # arrive over the next ~1s per player.
+        if mmr_client.is_enabled():
+            mmr_log(f"on_initialized: enqueueing {len(payload['players'])} player(s) "
+                    f"(including self={self_id!r})")
+            mmr_client.enqueue_roster(payload["players"])
+        else:
+            mmr_log(f"on_initialized: MMR disabled, skipping enqueue "
+                    f"(enabled_flag={cfg.get('mmr_enabled', False)}, "
+                    f"curl_cffi_loaded={mmr_client._requests is not None})")
+        rerender_h2h()
+        update_overlay()
+        print(f"[match] initialized arena={payload['arena']} myTeam={payload['myTeam']}")
+
+    def on_ended(payload: dict):
+        state["in_match"] = False
+        session.on_match_ended(payload)
+        i_won = payload["winner"] == payload["myTeam"]
+        record = {
+            "matchGuid": payload.get("matchGuid"),
+            "endedAt": now_iso(),
+            "arena": payload["arena"],
+            "myTeam": payload["myTeam"],
+            "winner": payload["winner"],
+            "result": "W" if i_won else "L",
+            "score": payload.get("score"),
+            "playlist": playlist_from_player_count(len(payload["players"])),
+            "players": payload["players"],
+        }
+        append_match(record)
+        update_players_cache(players_db, record)
+        save_players(players_db)
+        score_str = ""
+        if isinstance(record.get("score"), list) and len(record["score"]) == 2:
+            mt = payload["myTeam"]
+            score_str = f" ({record['score'][mt]}–{record['score'][1 - mt]})"
+        print(f"[match] ended {'WIN' if i_won else 'LOSS'}{score_str}")
+        # Force-refresh self MMR after the match — TRN's edge cache is sticky
+        # (we observed ~8 min of staleness in practice), so we poll every 2 min
+        # for up to 10 min and stop early once TRN's lastUpdated actually rolls
+        # past where we started. See start_post_match_mmr_poll() below.
+        self_id = cfg.get("self_player_id")
+        if mmr_client.is_enabled() and self_id:
+            self_player = next((p for p in payload["players"]
+                                if p["key"] == self_id), None)
+            if self_player:
+                start_post_match_mmr_poll(self_player)
+        # Auto-popup the post-match summary card. Stays up until the next match
+        # starts (match_initialized) or the user leaves to the menu (match_destroyed),
+        # with a 30s safety net for cases where neither event fires.
+        if cfg.get("show_match_summary", True):
+            state["summary_html"] = render_summary_html(payload, match_stats)
+            state["summary_visible"] = True
+            focus_timer.start()
+            update_overlay()
+            summary_timer.start(int(cfg.get("match_summary_seconds", 30)) * 1000)
+
+    def on_destroyed():
+        state["in_match"] = False
+        hide_summary()  # leaving the match → drop the post-match popup
+        state["h2h_html"] = idle_html("Waiting for next match…")
+        update_overlay()
+
+    def on_status(connected: bool):
+        if state["in_match"]:
+            return
+        if connected:
+            state["h2h_html"] = idle_html("Connected — waiting for match…")
+        else:
+            state["h2h_html"] = idle_html(
+                "Disconnected — is RL running with the Stats API enabled?")
+        update_overlay()
+
+    def on_event_for_session(event: str, data: dict):
+        # Only count events while a real match is in progress (between match_initialized
+        # and match_ended/match_destroyed). Excludes free practice / training / menus.
+        if state["in_match"]:
+            session.on_event(event, data)
+            match_stats.on_event(event, data)
+
+    stats.match_initialized.connect(on_initialized)
+    stats.match_ended.connect(on_ended)
+    stats.match_destroyed.connect(on_destroyed)
+    stats.connection_status.connect(on_status)
+    stats.event_seen.connect(on_event_for_session)
+    hotkey_h2h.pressed.connect(on_h2h_pressed)
+    hotkey_h2h.released.connect(on_h2h_released)
+    hotkey_session.pressed.connect(on_session_pressed)
+    hotkey_session.released.connect(on_session_released)
+
+    def toggle_expand():
+        # Context-sensitive: when F12 is held, F11 swaps the session sub-view
+        # between session card and graph. Otherwise (Tab held or nothing
+        # held), it keeps the existing H2H-expand toggle behavior.
+        if state["session_held"]:
+            nxt = "graph" if state["session_view"] == "session" else "session"
+            state["session_view"] = nxt
+            cfg["session_view"] = nxt
+            save_config(cfg)
+            print(f"[overlay] session_view={nxt}", file=sys.stderr)
+        else:
+            state["h2h_expanded"] = not state["h2h_expanded"]
+            cfg["h2h_default_expanded"] = state["h2h_expanded"]
+            save_config(cfg)
+            print(f"[overlay] expanded={state['h2h_expanded']}", file=sys.stderr)
+        update_overlay()
+
+    hotkey_expand.pressed.connect(toggle_expand)
+
+    def cycle_mmr_category():
+        # Context-sensitive: while the graph view is showing (F12 held +
+        # session_view=="graph"), F10 cycles the graph's playlist instead of
+        # the H2H MMR category. Same key, different role per context — same
+        # idea as F11 (expand H2H vs swap session subview).
+        if state["session_held"] and state["session_view"] == "graph":
+            cur_pl = state["graph_playlist"]
+            i = RANKED_PLAYLISTS.index(cur_pl) if cur_pl in RANKED_PLAYLISTS else -1
+            nxt_pl = RANKED_PLAYLISTS[(i + 1) % len(RANKED_PLAYLISTS)]
+            state["graph_playlist"] = nxt_pl
+            cfg["graph_playlist"] = nxt_pl
+            save_config(cfg)
+            mmr_log(f"F10 cycle_graph_playlist: {cur_pl!r} -> {nxt_pl!r}")
+            update_overlay()
+            return
+        cur = cfg.get("mmr_category", "best")
+        try:
+            i = MMR_CATEGORIES.index(cur)
+        except ValueError:
+            i = -1
+        nxt = MMR_CATEGORIES[(i + 1) % len(MMR_CATEGORIES)]
+        cfg["mmr_category"] = nxt
+        save_config(cfg)
+        mmr_log(f"F10 cycle_category: {cur!r} -> {nxt!r}")
+        rerender_h2h()
+        update_overlay()
+
+    hotkey_cycle.pressed.connect(cycle_mmr_category)
+
+    # Tracks the last self entry we logged so we can compute deltas (and skip
+    # writes when nothing has changed). Seeded from disk cache below.
+    last_self_log = {"playlists": {}, "lastUpdated": None}
+
+    # Lazy cache for mmr_history.jsonl. We don't load at startup — the graph
+    # view is opened by maybe 1% of users on any given session, so we pay the
+    # parse cost only on first F11-from-session. The `dirty` flag is set by
+    # _log_my_mmr after a history append, telling the graph render to reparse
+    # before drawing. mtime-based invalidation also guards against external
+    # edits.
+    mmr_history_cache = {
+        "loaded": False, "snapshots": [], "matches": [],
+        "mtime_history": 0.0, "mtime_matches": 0.0, "dirty": False,
+    }
+
+    def _log_my_mmr(entry: dict):
+        """Append one line per *meaningful* refresh to my_mmr.log: per-playlist
+        MMR, deltas, and TRN's lastUpdated. Skips the write when no playlist
+        moved AND TRN's snapshot hasn't rolled — those entries were just our
+        force-refreshes hitting TRN's static edge cache and add no signal."""
+        prev = last_self_log["playlists"]
+        cur = entry.get("playlists") or {}
+        last_updated = entry.get("lastUpdated") or "?"
+
+        any_change = any(
+            (cur.get(lbl) or {}).get("mmr") != (prev.get(lbl) or {}).get("mmr")
+            for lbl in RANKED_PLAYLISTS
+        )
+        trn_rolled = last_updated != last_self_log["lastUpdated"]
+        first_entry = not last_self_log["lastUpdated"]
+        if not (any_change or trn_rolled or first_entry):
+            return  # static cache hit; saying so over and over is just noise
+
+        parts = []
+        for label in RANKED_PLAYLISTS:
+            cv = (cur.get(label) or {}).get("mmr")
+            pv = (prev.get(label) or {}).get("mmr")
+            if cv is None:
+                parts.append(f"{label}=—")
+            elif pv is None:
+                parts.append(f"{label}={cv}")
+            elif cv == pv:
+                parts.append(f"{label}={cv} (·)")
+            else:
+                parts.append(f"{label}={cv} ({cv - pv:+d})")
+        best = entry.get("best") or {}
+        best_part = (
+            f"best={best.get('mmr')}@{best.get('playlist')}"
+            if best else "best=—"
+        )
+        line = (
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"{'  '.join(parts)}  {best_part}  "
+            f"trn_lastUpdated={last_updated}"
+        )
+        try:
+            with MY_MMR_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            mmr_log(f"my_mmr.log write failed: {e}")
+        # Persist a structured snapshot to mmr_history.jsonl for the graph
+        # view. Stricter dedupe than the log: only write when TRN's
+        # lastUpdated actually advanced (or first entry ever) — otherwise
+        # the attribution algorithm could double-count an interval.
+        if trn_rolled or first_entry:
+            snap = {
+                "ts": now_iso(),
+                "trn_lastUpdated": last_updated,
+                "playlists": {
+                    lbl: (cur.get(lbl) or {}).get("mmr")
+                    for lbl in RANKED_PLAYLISTS
+                    if (cur.get(lbl) or {}).get("mmr") is not None
+                },
+            }
+            append_mmr_history(snap)
+            mmr_history_cache["dirty"] = True
+        last_self_log["playlists"] = cur
+        last_self_log["lastUpdated"] = last_updated
+
+    # Seed last_self_log from disk cache so deltas span restarts AND so the
+    # first refresh after launch doesn't write a noise line if nothing moved.
+    self_id = cfg.get("self_player_id")
+    if self_id:
+        existing_self = mmr_client.get(self_id)
+        if existing_self and not existing_self.get("not_found"):
+            last_self_log["playlists"] = existing_self.get("playlists") or {}
+            last_self_log["lastUpdated"] = existing_self.get("lastUpdated")
+            mmr_log(f"seed last_self_log from cache: "
+                    f"{list(last_self_log['playlists'].keys())} "
+                    f"trn_lastUpdated={last_self_log['lastUpdated']}")
+
+    def on_mmr_updated(key: str):
+        # Self MMR refresh? Mirror the snapshot to my_mmr.log for tracking.
+        sid = cfg.get("self_player_id")
+        if sid and key == sid:
+            entry = mmr_client.get(key)
+            if entry and not entry.get("not_found"):
+                _log_my_mmr(entry)
+        # Coalesce repaints — many opponents resolving in quick succession would
+        # otherwise re-render once per arrival. The 200ms timer is single-shot
+        # and rearmed on every signal, so we only repaint after the queue lulls.
+        mmr_repaint_timer.start(200)
+
+    mmr_repaint_timer = QTimer()
+    mmr_repaint_timer.setSingleShot(True)
+
+    def _mmr_repaint():
+        if state["in_match"]:
+            rerender_h2h()
+            update_overlay()
+
+    mmr_repaint_timer.timeout.connect(_mmr_repaint)
+    mmr_client.updated.connect(on_mmr_updated)
+
+    # System tray icon — gives the user a way to quit when launched via start.bat
+    # (which uses pythonw and so has no console window to Ctrl+C).
+    tray = None
+    status_action = None
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray = QSystemTrayIcon(make_tray_icon())
+        tray.setToolTip("Rocket League H2H — starting…")
+
+        menu = QMenu()
+        title_action = QAction("Rocket League H2H")
+        title_action.setEnabled(False)
+        menu.addAction(title_action)
+        status_action = QAction("Status: starting…")
+        status_action.setEnabled(False)
+        menu.addAction(status_action)
+        menu.addSeparator()
+
+        open_action = QAction("Open data folder")
+        def _open_folder():
+            try:
+                if sys.platform == "win32":
+                    os.startfile(str(DATA_DIR))  # type: ignore[attr-defined]
+                else:
+                    opener = "open" if sys.platform == "darwin" else "xdg-open"
+                    subprocess.Popen([opener, str(DATA_DIR)])
+            except Exception as e:
+                print(f"[tray] open folder failed: {e}", file=sys.stderr)
+        open_action.triggered.connect(_open_folder)
+        menu.addAction(open_action)
+
+        reset_session_action = QAction("Reset session stats")
+        def _reset_session():
+            session.reset()
+            match_stats.reset(self_name=session.self_name)
+            print("[reset] session stats cleared", file=sys.stderr)
+            update_overlay()
+        reset_session_action.triggered.connect(_reset_session)
+        menu.addAction(reset_session_action)
+
+        wipe_history_action = QAction("Wipe match history…")
+        def _wipe_history():
+            # Drain any queued match_ended slot first — otherwise a match that
+            # ended just before the user clicked Wipe would write its record
+            # *after* we've shown the dialog, and then we'd silently delete it.
+            QApplication.processEvents()
+            reply = QMessageBox.question(
+                None,
+                "Wipe match history",
+                "Permanently delete matches.jsonl and players.json?\n"
+                "Your current session stats are kept.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            for path in (MATCHES_PATH, PLAYERS_PATH):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    print(f"[reset] failed to delete {path.name}: {e}", file=sys.stderr)
+            players_db.clear()
+            # The cached H2H card was rendered against the now-wiped opponent
+            # records — refresh so a held Tab during this match doesn't show
+            # stale W/L counts. (Idle text until the next match starts.)
+            state["h2h_html"] = idle_html("History wiped — fresh start.")
+            print("[reset] match history wiped", file=sys.stderr)
+            update_overlay()
+        wipe_history_action.triggered.connect(_wipe_history)
+        menu.addAction(wipe_history_action)
+        menu.addSeparator()
+
+        mmr_action = QAction("Show MMR (sends opponent IDs to tracker.gg)")
+        mmr_action.setCheckable(True)
+        mmr_action.setChecked(bool(cfg.get("mmr_enabled", False)))
+        def _toggle_mmr(checked: bool):
+            cfg["mmr_enabled"] = bool(checked)
+            save_config(cfg)
+            mmr_client.set_enabled(bool(checked))
+            mmr_log(f"tray toggle: enabled={cfg['mmr_enabled']} "
+                    f"in_match={state['in_match']} "
+                    f"roster_size={len(state.get('roster') or [])}")
+            # Flipping ON in the middle of a match: enqueue the current roster
+            # immediately so the user sees data without waiting for the next
+            # match. Flipping OFF: just re-render so the chips disappear.
+            if checked and state["in_match"] and state["roster"]:
+                mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
+                mmr_client.enqueue_roster(state["roster"])
+            rerender_h2h()
+            update_overlay()
+        mmr_action.toggled.connect(_toggle_mmr)
+        menu.addAction(mmr_action)
+        menu.addSeparator()
+
+        auto_update_action = QAction("Auto-update on launch")
+        auto_update_action.setCheckable(True)
+        auto_update_action.setChecked(bool(cfg.get("auto_update", False)))
+        def _toggle_auto_update(checked: bool):
+            cfg["auto_update"] = bool(checked)
+            save_config(cfg)
+            print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
+        auto_update_action.toggled.connect(_toggle_auto_update)
+        menu.addAction(auto_update_action)
+        menu.addSeparator()
+
+        quit_action = QAction("Quit")
+        quit_action.triggered.connect(app.quit)
+        menu.addAction(quit_action)
+
+        tray.setContextMenu(menu)
+        tray.show()
+
+        # Skip the Qt setText/setToolTip churn when the connection state hasn't
+        # changed — connection_status emits on every reconnect attempt failure
+        # during a backoff storm, and Qt does compare strings, but building the
+        # f-string and crossing the C++ boundary is wasted work.
+        last_tray_state = [None]  # boxed for closure assignment
+
+        def update_tray_status(connected: bool):
+            if last_tray_state[0] == connected:
+                return
+            last_tray_state[0] = connected
+            label = "Connected" if connected else "Disconnected"
+            if status_action is not None:
+                status_action.setText(f"Status: {label}")
+            tray.setToolTip(f"Rocket League H2H — {label}")
+        stats.connection_status.connect(update_tray_status)
+    else:
+        print("[tray] system tray not available; quit via Task Manager / Ctrl+C",
+              file=sys.stderr)
+
+    stats.start()
+    hotkey_h2h.start()
+    hotkey_session.start()
+    hotkey_expand.start()
+    hotkey_cycle.start()
+
+    print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
+          f"expand={cfg.get('expand_hotkeys') or []} "
+          f"cycle={cfg.get('cycle_hotkeys') or []} "
+          f"position={cfg['position']} tcp://{cfg['host']}:{cfg['port']}")
+    print(f"        require_rl_focus={cfg.get('require_rl_focus', True)} "
+          f"expanded={state['h2h_expanded']} "
+          f"mmr={cfg.get('mmr_enabled', False)}/{cfg.get('mmr_category', 'best')} "
+          f"self={cfg.get('self_player_id') or '(auto-detect on first 1v1)'}")
+    print(f"        matches → {MATCHES_PATH}")
+    print(f"        players → {PLAYERS_PATH}")
+
+    rc = app.exec()
+    stats.stop()
+    hotkey_h2h.stop()
+    hotkey_session.stop()
+    hotkey_expand.stop()
+    hotkey_cycle.stop()
+    mmr_client.stop()
+    sys.exit(rc)

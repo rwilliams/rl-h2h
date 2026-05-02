@@ -42,22 +42,22 @@ TIMEOUT_NETWORK = 30.0
 MAX_ARCHIVE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+LOG_DIR = APP_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 VERSION_PATH = APP_DIR / "VERSION"
 TREE_PATH = APP_DIR / "VERSION.tree.json"
-LOG_PATH = APP_DIR / "update.log"
-CONFIG_PATH = APP_DIR / "config.json"
+LOG_PATH = LOG_DIR / "update.log"
+CONFIG_PATH = DATA_DIR / "config.json"
 
 # Files the updater must never overwrite or use to detect "dirty".
 # Mirrors .gitignore. Anything matching these is left alone in zip mode.
-PROTECTED = {
-    "config.json", "config.json.tmp",
-    "matches.jsonl",
-    "players.json", "players.json.tmp",
-    "update.log",
-    "VERSION.tree.json",
-}
-PROTECTED_PREFIXES = ("players.corrupt-", ".git/", ".venv/", "venv/", "env/",
-                       "__pycache__/", ".vscode/", ".idea/", ".playwright-mcp/")
+PROTECTED = {"VERSION.tree.json"}
+PROTECTED_PREFIXES = (
+    "data/", "logs/",
+    ".git/", ".venv/", "venv/", "env/",
+    "__pycache__/", ".vscode/", ".idea/", ".playwright-mcp/",
+)
 
 
 def log(msg: str) -> None:
