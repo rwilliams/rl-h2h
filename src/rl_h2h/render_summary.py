@@ -50,6 +50,20 @@ def render_summary_html(payload: dict, ms: MatchStats) -> str:
         play_rows.append(stat_row("Demoed",    str(ms.demoed_self)))
     if ms.crossbars: play_rows.append(stat_row("Crossbars", pair_count(ms.crossbars, ms.crossbars_self, always_pair=True)))
 
+    # ACTIVITY rows: derived from UpdateState ticks. Touches is exact (cumulative
+    # API counter); distance and boost-used are integrated locally at ~2 Hz, so
+    # they're prefixed with ~ to flag them as approximations.
+    t_scope, t_self = ms.touches_leader()
+    d_scope, d_self = ms.distance_leader_m()
+    b_scope, b_self = ms.boost_used_leader()
+    activity_rows = []
+    if t_scope:
+        activity_rows.append(stat_row("Touches", pair_count(t_scope, t_self, always_pair=True)))
+    if d_scope:
+        activity_rows.append(stat_row("Distance", f"~{d_scope}m{colors.PAIR_SEP}~{d_self}m"))
+    if b_scope:
+        activity_rows.append(stat_row("Boost used", f"~{b_scope}{colors.PAIR_SEP}~{b_self}"))
+
     fun_rows = []
     if ms.max_goal_speed > 0:
         fun_rows.append(stat_row("Max goal speed",   pair_max(ms.max_goal_speed, ms.max_goal_speed_self, always_pair=True)))
@@ -68,6 +82,8 @@ def render_summary_html(payload: dict, ms: MatchStats) -> str:
     body = ""
     if play_rows:
         body += stat_section("PLAY", play_rows)
+    if activity_rows:
+        body += stat_section("ACTIVITY", activity_rows)
     if fun_rows:
         body += stat_section("FUN", fun_rows)
     if body:

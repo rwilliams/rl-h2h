@@ -1,6 +1,7 @@
 """Session-wide and per-match stat aggregators, plus the session card renderer."""
 from __future__ import annotations
 
+import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,10 +12,17 @@ from .constants import (
     EVT_CROSSBAR_HIT,
     EVT_GOAL_SCORED,
     EVT_STATFEED,
+    EVT_UPDATE_STATE,
     SF_DEMOLISH,
     SF_SAVE,
     SF_SHOT,
 )
+
+# Speed in UpdateState arrives as Unreal Units / second. 1 uu ≈ 1 cm,
+# so distance_m = sum(speed_uu * dt) / 100. UpdateState fires at ~2 Hz; gaps
+# longer than this are pauses/replays, not movement we should integrate.
+_UU_PER_METER = 100.0
+_MAX_INTEGRATION_DT = 1.5
 from .storage import last_touch_player
 
 
@@ -163,6 +171,11 @@ class MatchStats:
         self.fastest_goal_time_self: Optional[float] = None
         self.own_goals = 0
         self.own_goals_self = 0
+        # Per-player UpdateState aggregates. Keyed by player Name.
+        # Touches is the API's cumulative counter (just store latest); distance and
+        # boost-used are integrated locally from Speed and Boost deltas.
+        self._players: dict[str, dict] = {}
+        self._last_update_t: Optional[float] = None
 
     def _is_self(self, name) -> bool:
         return bool(name) and name == self.self_name
@@ -228,6 +241,73 @@ class MatchStats:
                     self.demos_self += 1
                 if self._is_self(sec_name):
                     self.demoed_self += 1
+        elif event == EVT_UPDATE_STATE:
+            self._absorb_update_state(data)
+
+    def _absorb_update_state(self, data: dict) -> None:
+        players = data.get("Players")
+        if not isinstance(players, list):
+            return
+        now = time.monotonic()
+        prev = self._last_update_t
+        self._last_update_t = now
+        # Skip integration on the very first tick or after long gaps (replays,
+        # pauses, between matches). Touches still updates — it's a snapshot.
+        dt = (now - prev) if prev is not None else 0.0
+        if dt < 0 or dt > _MAX_INTEGRATION_DT:
+            dt = 0.0
+        for p in players:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("Name")
+            if not isinstance(name, str) or not name:
+                continue
+            st = self._players.setdefault(
+                name, {"touches": 0, "distance_uu": 0.0, "boost_used": 0.0, "last_boost": None}
+            )
+            t = p.get("Touches")
+            if isinstance(t, int) and t > st["touches"]:
+                st["touches"] = t
+            if dt > 0:
+                sp = p.get("Speed")
+                if isinstance(sp, (int, float)) and sp > 0:
+                    st["distance_uu"] += float(sp) * dt
+            b = p.get("Boost")
+            if isinstance(b, (int, float)):
+                last = st["last_boost"]
+                if last is not None and b < last:
+                    st["boost_used"] += float(last - b)
+                st["last_boost"] = float(b)
+
+    def _self_state(self) -> Optional[dict]:
+        if not self.self_name:
+            return None
+        return self._players.get(self.self_name)
+
+    def touches_leader(self) -> tuple[int, int]:
+        """Return (max touches across players, self's touches)."""
+        if not self._players:
+            return (0, 0)
+        scope = max(s["touches"] for s in self._players.values())
+        me = self._self_state()
+        return (int(scope), int(me["touches"]) if me else 0)
+
+    def distance_leader_m(self) -> tuple[int, int]:
+        """Return (max distance in metres, self's distance in metres)."""
+        if not self._players:
+            return (0, 0)
+        scope_uu = max(s["distance_uu"] for s in self._players.values())
+        me = self._self_state()
+        self_uu = me["distance_uu"] if me else 0.0
+        return (int(scope_uu / _UU_PER_METER), int(self_uu / _UU_PER_METER))
+
+    def boost_used_leader(self) -> tuple[int, int]:
+        """Return (max boost used across players, self's boost used)."""
+        if not self._players:
+            return (0, 0)
+        scope = max(s["boost_used"] for s in self._players.values())
+        me = self._self_state()
+        return (int(scope), int(me["boost_used"]) if me else 0)
 
 
 # ---- Render helpers ---------------------------------------------------------
