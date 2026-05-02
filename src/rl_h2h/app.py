@@ -7,18 +7,18 @@ import subprocess
 import sys
 from datetime import datetime
 
-from PySide6.QtCore import QLockFile, QTimer
+from PySide6.QtCore import QLockFile, QObject, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from . import colors
 from .applog import mmr_log
 from .config import load_config, save_config
-from .hotkey import HotkeyManager, is_rl_focused
+from .hotkey import HotkeyManager, capture_next_input, is_rl_focused
 from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history, load_mmr_history
 from .overlay import Overlay
 from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
-from .render_h2h import h2h_footer_html, idle_html, render_html, session_footer_html
+from .render_h2h import h2h_footer_html, idle_html, render_html, render_menu_html, session_footer_html
 from .render_summary import render_match_stats_html, render_summary_html
 from .session_stats import MatchStats, SessionStats, render_session_html
 from .stats_client import StatsClient
@@ -69,6 +69,12 @@ def main():
     hotkey_session = HotkeyManager(cfg.get("session_hotkeys") or [])
     hotkey_expand = HotkeyManager(cfg.get("expand_hotkeys") or [])
     hotkey_cycle = HotkeyManager(cfg.get("cycle_hotkeys") or [])
+    # In-game settings menu: F5 toggles, arrows navigate, Enter selects.
+    # Esc only matters during rebind capture (handled inside capture_next_input).
+    hotkey_menu_toggle = HotkeyManager([cfg.get("menu_hotkey") or "f5"])
+    hotkey_menu_up = HotkeyManager(["up"])
+    hotkey_menu_down = HotkeyManager(["down"])
+    hotkey_menu_enter = HotkeyManager(["enter"])
 
     # Sanitize the persisted category once at startup — guards against a hand-edited
     # config setting (e.g. "1V1" instead of "1v1"). Falls back to "best".
@@ -89,6 +95,10 @@ def main():
         "my_team": 0,
         "arena": "",
         "team_colors": {},
+        # In-game settings menu state.
+        "menu_visible": False,
+        "menu_index": 0,
+        "menu_capture": None,  # cfg key being rebound, or None
     }
     if state["session_view"] not in ("session", "graph"):
         state["session_view"] = "session"
@@ -100,6 +110,16 @@ def main():
                 or state["summary_visible"])
 
     def update_overlay():
+        # Settings menu wins over everything and bypasses the focus check —
+        # the user opened it deliberately and may want to reach it from the
+        # desktop.
+        if state["menu_visible"]:
+            overlay.set_html(render_menu_html(
+                _menu_rows(), state["menu_index"], state["menu_capture"] is not None,
+            ))
+            overlay.show()
+            overlay.raise_()
+            return
         if not _any_visible():
             focus_timer.stop()
             overlay.hide()
@@ -458,6 +478,186 @@ def main():
 
     hotkey_cycle.pressed.connect(cycle_mmr_category)
 
+    # ── Settings menu ────────────────────────────────────────────────────────
+    # Actions that can be rebound from the menu, in display order. Each entry
+    # is (cfg_key, display_label, manager). The cfg_key is also the row id
+    # used in capture state.
+    rebindable = (
+        ("hotkeys",         "H2H hold",  hotkey_h2h),
+        ("session_hotkeys", "Session",   hotkey_session),
+        ("expand_hotkeys",  "Expand",    hotkey_expand),
+        ("cycle_hotkeys",   "Cycle MMR", hotkey_cycle),
+    )
+
+    def _split_bindings(bindings: list) -> tuple:
+        kb = next((b for b in bindings if not b.startswith("pad_")), None)
+        pad = next((b for b in bindings if b.startswith("pad_")), None)
+        return kb, pad
+
+    def _replace_binding_slot(current: list, new_name: str) -> list:
+        """Replace either the kb slot or the pad slot, keeping the other.
+        Order: keyboard first, gamepad second (matches default config)."""
+        is_pad = new_name.startswith("pad_")
+        kept = [b for b in current if b.startswith("pad_") != is_pad]
+        return (kept + [new_name]) if is_pad else ([new_name] + kept)
+
+    def apply_mmr_toggle(value: bool) -> None:
+        cfg["mmr_enabled"] = bool(value)
+        save_config(cfg)
+        mmr_client.set_enabled(bool(value))
+        mmr_log(f"toggle: enabled={cfg['mmr_enabled']} "
+                f"in_match={state['in_match']} "
+                f"roster_size={len(state.get('roster') or [])}")
+        if value and state["in_match"] and state["roster"]:
+            mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
+            mmr_client.enqueue_roster(state["roster"])
+        rerender_h2h()
+        # Sync the tray QAction without re-firing its toggled handler.
+        if mmr_action is not None and mmr_action.isChecked() != bool(value):
+            blocked = mmr_action.blockSignals(True)
+            mmr_action.setChecked(bool(value))
+            mmr_action.blockSignals(blocked)
+
+    def apply_show_match_summary(value: bool) -> None:
+        cfg["show_match_summary"] = bool(value)
+        save_config(cfg)
+
+    def apply_auto_update(value: bool) -> None:
+        cfg["auto_update"] = bool(value)
+        save_config(cfg)
+        print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
+        if auto_update_action is not None and auto_update_action.isChecked() != bool(value):
+            blocked = auto_update_action.blockSignals(True)
+            auto_update_action.setChecked(bool(value))
+            auto_update_action.blockSignals(blocked)
+
+    # Forward refs filled when the tray is built (may stay None if no tray).
+    mmr_action = None
+    auto_update_action = None
+
+    def _menu_rows() -> list:
+        rows: list = [{"type": "header", "label": "TOGGLES"}]
+        rows.append({"type": "toggle", "label": "MMR enabled",
+                     "value": bool(cfg.get("mmr_enabled", False)),
+                     "toggle_key": "mmr_enabled"})
+        rows.append({"type": "toggle", "label": "Auto match summary",
+                     "value": bool(cfg.get("show_match_summary", True)),
+                     "toggle_key": "show_match_summary"})
+        rows.append({"type": "toggle", "label": "Auto-update on launch",
+                     "value": bool(cfg.get("auto_update", False)),
+                     "toggle_key": "auto_update"})
+        rows.append({"type": "spacer"})
+        rows.append({"type": "header", "label": "BINDINGS"})
+        for cfg_key, label, _mgr in rebindable:
+            kb, pad = _split_bindings(cfg.get(cfg_key) or [])
+            rows.append({"type": "binding", "label": label,
+                         "kb": kb, "pad": pad, "action_key": cfg_key})
+        return rows
+
+    def _selectable_indices() -> list:
+        return [i for i, r in enumerate(_menu_rows())
+                if r["type"] in ("toggle", "binding")]
+
+    def on_menu_toggle():
+        # While capturing, F5 is just another key — let the capture listener
+        # consume it. We short-circuit so we don't close the menu.
+        if state["menu_capture"] is not None:
+            return
+        state["menu_visible"] = not state["menu_visible"]
+        if state["menu_visible"]:
+            state["menu_index"] = _selectable_indices()[0] if _selectable_indices() else 0
+        update_overlay()
+
+    def on_menu_up():
+        if not state["menu_visible"] or state["menu_capture"] is not None:
+            return
+        sel = _selectable_indices()
+        if not sel:
+            return
+        try:
+            i = sel.index(state["menu_index"])
+        except ValueError:
+            i = 0
+        state["menu_index"] = sel[(i - 1) % len(sel)]
+        update_overlay()
+
+    def on_menu_down():
+        if not state["menu_visible"] or state["menu_capture"] is not None:
+            return
+        sel = _selectable_indices()
+        if not sel:
+            return
+        try:
+            i = sel.index(state["menu_index"])
+        except ValueError:
+            i = 0
+        state["menu_index"] = sel[(i + 1) % len(sel)]
+        update_overlay()
+
+    # Bridge for the rebind-capture callback. capture_next_input invokes its
+    # callback from a worker thread; we re-emit through a Qt signal so the
+    # config write + UI refresh happen on the main thread.
+    class _CaptureBridge(QObject):
+        captured = Signal(object)
+    capture_bridge = _CaptureBridge()
+
+    def _on_captured(name):
+        action_key = state["menu_capture"]
+        state["menu_capture"] = None
+        if action_key is None:
+            update_overlay()
+            return
+        if name is None:
+            mmr_log(f"menu rebind cancelled for {action_key!r}")
+            update_overlay()
+            return
+        # Don't let users rebind to the menu hotkey itself — they'd lose the
+        # only way back into the menu.
+        if name == (cfg.get("menu_hotkey") or "f5"):
+            mmr_log(f"menu rebind ignored: {name!r} is the menu hotkey")
+            update_overlay()
+            return
+        current = list(cfg.get(action_key) or [])
+        new_bindings = _replace_binding_slot(current, name)
+        cfg[action_key] = new_bindings
+        save_config(cfg)
+        for cfg_key, _label, mgr in rebindable:
+            if cfg_key == action_key:
+                mgr.set_bindings(new_bindings)
+                break
+        mmr_log(f"menu rebind: {action_key} = {new_bindings}")
+        update_overlay()
+
+    capture_bridge.captured.connect(_on_captured)
+
+    def on_menu_enter():
+        if not state["menu_visible"] or state["menu_capture"] is not None:
+            return
+        rows = _menu_rows()
+        if not (0 <= state["menu_index"] < len(rows)):
+            return
+        row = rows[state["menu_index"]]
+        if row["type"] == "toggle":
+            tk = row["toggle_key"]
+            new_val = not bool(cfg.get(tk, False))
+            if tk == "mmr_enabled":
+                apply_mmr_toggle(new_val)
+            elif tk == "show_match_summary":
+                apply_show_match_summary(new_val)
+            elif tk == "auto_update":
+                apply_auto_update(new_val)
+            update_overlay()
+        elif row["type"] == "binding":
+            state["menu_capture"] = row["action_key"]
+            update_overlay()  # show the "press…" hint
+            capture_next_input(lambda n: capture_bridge.captured.emit(n))
+
+    hotkey_menu_toggle.pressed.connect(on_menu_toggle)
+    hotkey_menu_up.pressed.connect(on_menu_up)
+    hotkey_menu_down.pressed.connect(on_menu_down)
+    hotkey_menu_enter.pressed.connect(on_menu_enter)
+    # ── End settings menu ────────────────────────────────────────────────────
+
     # Tracks the last self entry we logged so we can compute deltas (and skip
     # writes when nothing has changed). Seeded from disk cache below.
     last_self_log = {"playlists": {}, "lastUpdated": None}
@@ -647,19 +847,7 @@ def main():
         mmr_action.setCheckable(True)
         mmr_action.setChecked(bool(cfg.get("mmr_enabled", False)))
         def _toggle_mmr(checked: bool):
-            cfg["mmr_enabled"] = bool(checked)
-            save_config(cfg)
-            mmr_client.set_enabled(bool(checked))
-            mmr_log(f"tray toggle: enabled={cfg['mmr_enabled']} "
-                    f"in_match={state['in_match']} "
-                    f"roster_size={len(state.get('roster') or [])}")
-            # Flipping ON in the middle of a match: enqueue the current roster
-            # immediately so the user sees data without waiting for the next
-            # match. Flipping OFF: just re-render so the chips disappear.
-            if checked and state["in_match"] and state["roster"]:
-                mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
-                mmr_client.enqueue_roster(state["roster"])
-            rerender_h2h()
+            apply_mmr_toggle(bool(checked))
             update_overlay()
         mmr_action.toggled.connect(_toggle_mmr)
         menu.addAction(mmr_action)
@@ -669,9 +857,7 @@ def main():
         auto_update_action.setCheckable(True)
         auto_update_action.setChecked(bool(cfg.get("auto_update", False)))
         def _toggle_auto_update(checked: bool):
-            cfg["auto_update"] = bool(checked)
-            save_config(cfg)
-            print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
+            apply_auto_update(bool(checked))
         auto_update_action.toggled.connect(_toggle_auto_update)
         menu.addAction(auto_update_action)
         menu.addSeparator()
@@ -707,10 +893,15 @@ def main():
     hotkey_session.start()
     hotkey_expand.start()
     hotkey_cycle.start()
+    hotkey_menu_toggle.start()
+    hotkey_menu_up.start()
+    hotkey_menu_down.start()
+    hotkey_menu_enter.start()
 
     print(f"[ready] h2h={cfg['hotkeys']} session={cfg.get('session_hotkeys') or []} "
           f"expand={cfg.get('expand_hotkeys') or []} "
           f"cycle={cfg.get('cycle_hotkeys') or []} "
+          f"menu={cfg.get('menu_hotkey') or 'f5'} "
           f"position={cfg['position']} tcp://{cfg['host']}:{cfg['port']}")
     print(f"        require_rl_focus={cfg.get('require_rl_focus', True)} "
           f"expanded={state['h2h_expanded']} "
@@ -725,5 +916,9 @@ def main():
     hotkey_session.stop()
     hotkey_expand.stop()
     hotkey_cycle.stop()
+    hotkey_menu_toggle.stop()
+    hotkey_menu_up.stop()
+    hotkey_menu_down.stop()
+    hotkey_menu_enter.stop()
     mmr_client.stop()
     sys.exit(rc)

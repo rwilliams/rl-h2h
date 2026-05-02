@@ -90,6 +90,22 @@ class HotkeyManager(QObject):
         super().__init__()
         self._kb_targets: list[tuple] = []
         self._pad_targets: list[str] = []
+        self._down: set[tuple] = set()
+        self._kb_listener = keyboard.Listener(
+            on_press=self._on_kb_press, on_release=self._on_kb_release,
+        )
+        self._pad_thread: Optional[threading.Thread] = None
+        self._pad_stop = threading.Event()
+        self._started = False
+        self._apply_bindings(hotkey_names)
+        if self._pad_targets:
+            self._pad_thread = threading.Thread(
+                target=self._pad_loop, daemon=True, name="GamepadListener",
+            )
+
+    def _apply_bindings(self, hotkey_names: list[str]) -> None:
+        kb_targets: list[tuple] = []
+        pad_targets: list[str] = []
         for raw in hotkey_names:
             name = raw.strip().lower()
             if not name:
@@ -97,22 +113,37 @@ class HotkeyManager(QObject):
             if name.startswith("pad_"):
                 pad_name = name[4:]
                 if pad_name in GAMEPAD_BUTTONS:
-                    self._pad_targets.append(pad_name)
+                    pad_targets.append(pad_name)
                 else:
                     print(f"[hotkey] unknown gamepad key {raw!r}; "
                           f"valid: {sorted(GAMEPAD_BUTTONS)}", file=sys.stderr)
             else:
-                self._kb_targets.append(self._parse_kb(name))
-        self._down: set[tuple] = set()
-        self._kb_listener = keyboard.Listener(
-            on_press=self._on_kb_press, on_release=self._on_kb_release,
-        )
-        self._pad_thread: Optional[threading.Thread] = None
-        self._pad_stop = threading.Event()
-        if self._pad_targets:
+                try:
+                    kb_targets.append(self._parse_kb(name))
+                except ValueError as e:
+                    print(f"[hotkey] {e}", file=sys.stderr)
+        self._kb_targets = kb_targets
+        self._pad_targets = pad_targets
+
+    def set_bindings(self, hotkey_names: list[str]) -> None:
+        """Replace the active bindings live without restarting the listener.
+
+        Drops any held-trigger state (we'd otherwise leak a stuck `pressed`
+        if the user rebinds the action mid-hold). Spawns a gamepad thread
+        on demand if pad bindings appear after start()."""
+        was_held = bool(self._down)
+        self._apply_bindings(hotkey_names)
+        if was_held:
+            self._down.clear()
+            self.released.emit()
+        if self._started and self._pad_targets and (
+            self._pad_thread is None or not self._pad_thread.is_alive()
+        ):
+            self._pad_stop = threading.Event()
             self._pad_thread = threading.Thread(
                 target=self._pad_loop, daemon=True, name="GamepadListener",
             )
+            self._pad_thread.start()
 
     @staticmethod
     def _parse_kb(name: str):
@@ -161,10 +192,6 @@ class HotkeyManager(QObject):
             print("[hotkey] gamepad bindings configured but 'inputs' is not installed. "
                   "Run: pip install inputs", file=sys.stderr)
             return
-        wanted: dict[tuple, list[tuple]] = {}
-        for pad_name in self._pad_targets:
-            etype, ecode, target_val = GAMEPAD_BUTTONS[pad_name]
-            wanted.setdefault((etype, ecode), []).append((pad_name, target_val))
         active: dict[str, bool] = {}
         warned_no_pad = False
         print(f"[hotkey] gamepad listener watching: {self._pad_targets}", file=sys.stderr)
@@ -182,6 +209,11 @@ class HotkeyManager(QObject):
                 self._pad_stop.wait(2.0)
                 continue
             warned_no_pad = False
+            # Rebuild on each batch so set_bindings() applies live without a thread restart.
+            wanted: dict[tuple, list[tuple]] = {}
+            for pad_name in self._pad_targets:
+                etype, ecode, target_val = GAMEPAD_BUTTONS[pad_name]
+                wanted.setdefault((etype, ecode), []).append((pad_name, target_val))
             for ev in events:
                 key = (ev.ev_type, ev.code)
                 if key not in wanted:
@@ -205,7 +237,89 @@ class HotkeyManager(QObject):
         self._kb_listener.start()
         if self._pad_thread is not None:
             self._pad_thread.start()
+        self._started = True
 
     def stop(self):
         self._kb_listener.stop()
         self._pad_stop.set()
+
+
+def _kb_event_name(key) -> Optional[str]:
+    """pynput key → config-style binding name. None for unbindable events
+    (modifier-only releases, dead keys)."""
+    if hasattr(key, "name"):  # special keys: Tab, F1, Esc, …
+        return key.name.lower()
+    char = getattr(key, "char", None)
+    if char and len(char) == 1:
+        return char.lower()
+    return None
+
+
+def capture_next_input(on_done) -> None:
+    """Listen for one keyboard or gamepad press, then call `on_done(name)`.
+
+    `name` is a config-style binding string ('y', 'f1', 'tab', 'pad_lb', …)
+    or None if the user pressed Esc to cancel. Listeners stop after firing
+    once. Runs concurrently with any active HotkeyManager — pynput supports
+    multiple listeners observing the same key stream."""
+    done = threading.Event()
+    pad_stop = threading.Event()
+
+    def _emit(name: Optional[str]) -> None:
+        if done.is_set():
+            return
+        done.set()
+        pad_stop.set()
+        on_done(name)
+
+    def _on_press(key) -> bool:
+        if key == keyboard.Key.esc:
+            _emit(None)
+            return False
+        name = _kb_event_name(key)
+        if name is None:
+            return None
+        _emit(name)
+        return False  # stop the listener after the first valid press
+
+    listener = keyboard.Listener(on_press=_on_press)
+    listener.start()
+
+    def _pad_loop():
+        try:
+            import inputs as _inputs
+        except ImportError:
+            return
+        wanted: dict[tuple, list[tuple]] = {}
+        for pad_name, (etype, ecode, target_val) in GAMEPAD_BUTTONS.items():
+            wanted.setdefault((etype, ecode), []).append((pad_name, target_val))
+        while not pad_stop.is_set():
+            try:
+                events = _inputs.get_gamepad()
+            except _inputs.UnpluggedError:
+                pad_stop.wait(1.0)
+                continue
+            except Exception:
+                pad_stop.wait(1.0)
+                continue
+            for ev in events:
+                key = (ev.ev_type, ev.code)
+                if key not in wanted:
+                    continue
+                for pad_name, target_val in wanted[key]:
+                    if target_val == "thresh":
+                        if ev.state >= GAMEPAD_TRIGGER_THRESHOLD:
+                            _emit(f"pad_{pad_name}")
+                            return
+                    elif ev.ev_type == "Absolute":
+                        if ev.state == target_val:
+                            _emit(f"pad_{pad_name}")
+                            return
+                    else:
+                        if ev.state == 1:
+                            _emit(f"pad_{pad_name}")
+                            return
+                if done.is_set():
+                    return
+
+    threading.Thread(target=_pad_loop, daemon=True, name="GamepadCapture").start()
