@@ -505,51 +505,59 @@ def main():
         kept = [b for b in current if b.startswith("pad_") != is_pad]
         return (kept + [new_name]) if is_pad else ([new_name] + kept)
 
-    def apply_mmr_toggle(value: bool) -> None:
-        cfg["mmr_enabled"] = bool(value)
+    def _sync_tray_action(action, value: bool) -> None:
+        """Mirror the value onto a QAction without re-firing its toggled handler."""
+        if action is None or action.isChecked() == bool(value):
+            return
+        blocked = action.blockSignals(True)
+        action.setChecked(bool(value))
+        action.blockSignals(blocked)
+
+    def apply_toggle(cfg_key: str, value: bool, on_applied=None) -> None:
+        """Persist a bool config flag and run optional side effects."""
+        cfg[cfg_key] = bool(value)
         save_config(cfg)
-        mmr_client.set_enabled(bool(value))
-        mmr_log(f"toggle: enabled={cfg['mmr_enabled']} "
-                f"in_match={state['in_match']} "
-                f"roster_size={len(state.get('roster') or [])}")
-        if value and state["in_match"] and state["roster"]:
-            mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
-            mmr_client.enqueue_roster(state["roster"])
-        rerender_h2h()
-        # Sync the tray QAction without re-firing its toggled handler.
-        if mmr_action is not None and mmr_action.isChecked() != bool(value):
-            blocked = mmr_action.blockSignals(True)
-            mmr_action.setChecked(bool(value))
-            mmr_action.blockSignals(blocked)
+        if on_applied is not None:
+            on_applied(bool(value))
+
+    def apply_mmr_toggle(value: bool) -> None:
+        def _side_effects(v: bool) -> None:
+            mmr_client.set_enabled(v)
+            mmr_log(f"toggle: enabled={v} in_match={state['in_match']} "
+                    f"roster_size={len(state.get('roster') or [])}")
+            if v and state["in_match"] and state["roster"]:
+                mmr_log(f"  in-match enqueue {len(state['roster'])} player(s)")
+                mmr_client.enqueue_roster(state["roster"])
+            rerender_h2h()
+            _sync_tray_action(mmr_action, v)
+        apply_toggle("mmr_enabled", value, _side_effects)
 
     def apply_show_match_summary(value: bool) -> None:
-        cfg["show_match_summary"] = bool(value)
-        save_config(cfg)
+        apply_toggle("show_match_summary", value)
 
     def apply_auto_update(value: bool) -> None:
-        cfg["auto_update"] = bool(value)
-        save_config(cfg)
-        print(f"[update] auto_update={cfg['auto_update']}", file=sys.stderr)
-        if auto_update_action is not None and auto_update_action.isChecked() != bool(value):
-            blocked = auto_update_action.blockSignals(True)
-            auto_update_action.setChecked(bool(value))
-            auto_update_action.blockSignals(blocked)
+        def _side_effects(v: bool) -> None:
+            print(f"[update] auto_update={v}", file=sys.stderr)
+            _sync_tray_action(auto_update_action, v)
+        apply_toggle("auto_update", value, _side_effects)
 
     # Forward refs filled when the tray is built (may stay None if no tray).
     mmr_action = None
     auto_update_action = None
 
+    # (label, cfg_key, default, apply_fn) for each toggle, in display order.
+    toggleable = (
+        ("MMR enabled",           "mmr_enabled",        False, apply_mmr_toggle),
+        ("Auto match summary",    "show_match_summary", True,  apply_show_match_summary),
+        ("Auto-update on launch", "auto_update",        False, apply_auto_update),
+    )
+
     def _menu_rows() -> list:
         rows: list = [{"type": "header", "label": "TOGGLES"}]
-        rows.append({"type": "toggle", "label": "MMR enabled",
-                     "value": bool(cfg.get("mmr_enabled", False)),
-                     "toggle_key": "mmr_enabled"})
-        rows.append({"type": "toggle", "label": "Auto match summary",
-                     "value": bool(cfg.get("show_match_summary", True)),
-                     "toggle_key": "show_match_summary"})
-        rows.append({"type": "toggle", "label": "Auto-update on launch",
-                     "value": bool(cfg.get("auto_update", False)),
-                     "toggle_key": "auto_update"})
+        for label, cfg_key, default, apply_fn in toggleable:
+            rows.append({"type": "toggle", "label": label,
+                         "value": bool(cfg.get(cfg_key, default)),
+                         "apply": apply_fn})
         rows.append({"type": "spacer"})
         rows.append({"type": "header", "label": "BINDINGS"})
         # Menu key first so it's findable even if someone rebinds it to
@@ -577,7 +585,7 @@ def main():
             state["menu_index"] = _selectable_indices()[0] if _selectable_indices() else 0
         update_overlay()
 
-    def on_menu_up():
+    def on_menu_navigate(direction: int) -> None:
         if not state["menu_visible"] or state["menu_capture"] is not None:
             return
         sel = _selectable_indices()
@@ -587,20 +595,7 @@ def main():
             i = sel.index(state["menu_index"])
         except ValueError:
             i = 0
-        state["menu_index"] = sel[(i - 1) % len(sel)]
-        update_overlay()
-
-    def on_menu_down():
-        if not state["menu_visible"] or state["menu_capture"] is not None:
-            return
-        sel = _selectable_indices()
-        if not sel:
-            return
-        try:
-            i = sel.index(state["menu_index"])
-        except ValueError:
-            i = 0
-        state["menu_index"] = sel[(i + 1) % len(sel)]
+        state["menu_index"] = sel[(i + direction) % len(sel)]
         update_overlay()
 
     # Bridge for the rebind-capture callback. capture_next_input invokes its
@@ -662,14 +657,7 @@ def main():
             return
         row = rows[state["menu_index"]]
         if row["type"] == "toggle":
-            tk = row["toggle_key"]
-            new_val = not bool(cfg.get(tk, False))
-            if tk == "mmr_enabled":
-                apply_mmr_toggle(new_val)
-            elif tk == "show_match_summary":
-                apply_show_match_summary(new_val)
-            elif tk == "auto_update":
-                apply_auto_update(new_val)
+            row["apply"](not row["value"])
             update_overlay()
         elif row["type"] == "binding":
             state["menu_capture"] = row["action_key"]
@@ -677,8 +665,8 @@ def main():
             capture_next_input(lambda n: capture_bridge.captured.emit(n))
 
     hotkey_menu.toggle.connect(on_menu_toggle)
-    hotkey_menu.up.connect(on_menu_up)
-    hotkey_menu.down.connect(on_menu_down)
+    hotkey_menu.up.connect(lambda: on_menu_navigate(-1))
+    hotkey_menu.down.connect(lambda: on_menu_navigate(+1))
     hotkey_menu.enter.connect(on_menu_enter)
     # ── End settings menu ────────────────────────────────────────────────────
 
