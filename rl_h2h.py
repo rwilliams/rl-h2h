@@ -552,46 +552,43 @@ MMR_FETCH_INTERVAL = 2.0   # min seconds between outbound TRN requests
 # We rotate by truncating once we cross the cap — last write wins, no archive.
 _MMR_LOG_CAP = 256 * 1024
 _mmr_log_lock = threading.Lock()
+_api_dump_lock = threading.Lock()
+
+
+def _append_capped(path: Path, line: str, cap_bytes: int, lock: threading.Lock) -> None:
+    """Append `line + \\n` under `lock`, truncate-rotating once `path` exceeds
+    `cap_bytes`. Swallows OSError — a logging failure must never crash the
+    caller. Reused by `mmr_log` and `api_dump`."""
+    try:
+        with lock:
+            try:
+                if path.stat().st_size > cap_bytes:
+                    path.write_text("", encoding="utf-8")
+            except FileNotFoundError:
+                pass
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def mmr_log(msg: str) -> None:
     """Append a timestamped line to mmr.log AND mirror to stderr.
 
     Designed to work even under start.bat's `pythonw` launch (which discards
-    stdout/stderr) — the log file is the sole source of truth for debugging.
-    Failures writing the log are swallowed: a debug log breaking the app is
-    a worse outcome than missing one log line."""
+    stdout/stderr) — the log file is the sole source of truth for debugging."""
     line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
     print(f"[mmr] {msg}", file=sys.stderr)
-    try:
-        with _mmr_log_lock:
-            if MMR_LOG_PATH.exists() and MMR_LOG_PATH.stat().st_size > _MMR_LOG_CAP:
-                MMR_LOG_PATH.write_text("", encoding="utf-8")
-            with MMR_LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except OSError:
-        pass
-
-
-_api_dump_lock = threading.Lock()
+    _append_capped(MMR_LOG_PATH, line, _MMR_LOG_CAP, _mmr_log_lock)
 
 
 def api_dump(event: str, data: dict) -> None:
-    """Append one envelope as a JSON line to api_dump.log. Truncate-rotates
-    when the file exceeds API_DUMP_CAP_BYTES. Diagnostic-only — failures are
-    swallowed because a debug dump must never crash the parser."""
+    """Append one envelope as a JSON line to api_dump.log."""
     try:
         line = json.dumps({"ts": now_iso(), "Event": event, "Data": data})
     except (TypeError, ValueError):
         return
-    try:
-        with _api_dump_lock:
-            if API_DUMP_PATH.exists() and API_DUMP_PATH.stat().st_size > API_DUMP_CAP_BYTES:
-                API_DUMP_PATH.write_text("", encoding="utf-8")
-            with API_DUMP_PATH.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except OSError:
-        pass
+    _append_capped(API_DUMP_PATH, line, API_DUMP_CAP_BYTES, _api_dump_lock)
 
 
 def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
@@ -908,7 +905,6 @@ class StatsClient(QObject):
         self._task: Optional[asyncio.Task] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="StatsClient")
         self._api_dump_enabled = bool(api_dump_enabled)
-        self._update_state_count_this_match = 0
         self._reset()
 
     def _reset(self):
@@ -1003,21 +999,21 @@ class StatsClient(QObject):
             return
         event = msg.get("Event", "?")
         if self._api_dump_enabled:
-            # Decode the double-encoded Data payload up-front so the dump shows
-            # the unwrapped envelope. Mirrors the decoding done in _handle.
-            raw_data = msg.get("Data")
-            if isinstance(raw_data, str):
-                try:
-                    decoded = json.loads(raw_data) if raw_data else {}
-                except json.JSONDecodeError:
-                    decoded = raw_data
-            else:
-                decoded = raw_data if raw_data is not None else {}
-            if event == EVT_UPDATE_STATE:
-                if self._update_state_count_this_match < 3:
-                    api_dump(event, decoded)
-                    self._update_state_count_this_match += 1
-            else:
+            # UpdateState fires at 2 Hz; sample to keep api_dump.log small
+            # enough that a full session fits under the 2 MB cap.
+            should_dump = event != EVT_UPDATE_STATE
+            if not should_dump and self._update_state_count_this_match < 3:
+                should_dump = True
+                self._update_state_count_this_match += 1
+            if should_dump:
+                raw_data = msg.get("Data")
+                if isinstance(raw_data, str):
+                    try:
+                        decoded = json.loads(raw_data) if raw_data else {}
+                    except json.JSONDecodeError:
+                        decoded = raw_data
+                else:
+                    decoded = raw_data if raw_data is not None else {}
                 api_dump(event, decoded)
         try:
             self._handle(msg)
@@ -2500,10 +2496,8 @@ def attribute_mmr_points(playlist: str, snapshots: list[dict],
 
         if not interval_matches:
             if delta == 0:
-                # Idle interval for this playlist — no MMR motion and no
-                # match in this mode. Skip; emitting a flat snap here is
-                # what made the graph draw a horizontal line across days
-                # of 2v2-only play when looking at the 3v3 graph.
+                # Nothing happened in this playlist this interval — skip,
+                # otherwise idle intervals stack into a flat horizontal line.
                 continue
             # MMR moved without a recorded match — user played in another
             # session or outside our tracking. Plot the snapshot transition

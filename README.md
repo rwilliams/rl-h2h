@@ -125,6 +125,8 @@ The graph approximates **per-game** MMR change from the cumulative snapshots. Al
 
 When wins == losses (net zero), the step is the rolling median of past intervals' steps so deep-season MMR (which barely moves) still produces a sensible chart. The line is also reconciled to the actual snapshot value at every interval boundary, so rounding can't drift off truth.
 
+> **Ranked vs casual**: per-game points are derived, not exact. The Rocket League Stats API doesn't expose queue type ([audited](rl_api_text.md)), so if you mix ranked and casual matches in the same ~5-minute snapshot window, the MMR delta is split across all of them — a casual win in the middle of a ranked session will get credited a small "+MMR" it didn't actually earn. Snapshot boundaries always reconcile to the truth, so the totals stay correct.
+
 To wipe the graph data: delete `mmr_history.jsonl` next to the script.
 
 ## Config
