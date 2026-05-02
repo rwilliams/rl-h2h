@@ -5,10 +5,12 @@ tracker.network's public JSON endpoint, which serves real-time data behind a
 4-minute server-side cache. ``curl_cffi`` impersonates Chrome's TLS fingerprint
 so Cloudflare lets us through without a browser.
 
-Lookup quirk: TRN's profile endpoint indexes by display name across every
-platform we care about. Numeric platform IDs (raw 32-hex Epic, PSN/XBL ints)
-return 400/404. Cache key stays the stable Platform|Uid (so renames don't
-pollute our cache); the lookup string is the live wire's Name field.
+Lookup quirk: TRN indexes Epic/PSN/Xbox profiles by display name only —
+their numeric IDs (32-hex Epic UUID, PSN/XBL ints) return 400/404. Steam
+is the exception: SteamID64 works and is preferred (Steam display names
+aren't unique, so name lookups 404 for plenty of valid accounts). Cache
+key stays the stable Platform|Uid regardless, so renames don't pollute
+our cache.
 """
 from __future__ import annotations
 
@@ -81,16 +83,26 @@ MMR_FETCH_INTERVAL = 0.5
 
 
 def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
-    """(trn_platform_slug, display_name) for a wire identity, or None if
-    unsupported. TRN's lookup endpoint requires display name on every platform
-    we care about — numeric platform IDs return 400/404."""
-    if not name:
-        return None
+    """(trn_platform_slug, lookup_token) for a wire identity, or None if
+    unsupported.
+
+    Steam: use the SteamID64 from the wire — Steam display names are
+    non-unique and TRN's name lookup returns 404 for plenty of valid
+    accounts (observed live for handles like 'kllr'). The numeric
+    SteamID64 always resolves when the player has any tracker history.
+
+    Epic / PSN / Xbox: TRN only accepts the display name on these.
+    Their numeric IDs (32-hex Epic UUID, PSN/XBL ints) return 400/404.
+    """
     parts = primary_id.split("|")
     if not parts:
         return None
     plat = MMR_PLATFORM_TO_TRN.get(parts[0])
     if not plat:
+        return None
+    if plat == "steam" and len(parts) >= 2 and parts[1]:
+        return (plat, parts[1])
+    if not name:
         return None
     return (plat, name)
 
