@@ -84,30 +84,72 @@ To launch automatically every time Windows boots, press **Win + R**, type `shell
 
 The overlay is **held**, not toggled. Defaults match Rocket League's stock scoreboard binding so you can naturally peek at both at the same time.
 
-| Action               | PC      | Xbox    | PlayStation |
-|----------------------|---------|---------|-------------|
-| Head-to-head         | **Tab** | **LB**  | **L1**      |
-| Session stats        | **F12** | —       | —           |
-| Toggle expanded H2H  | **F11** | —       | —           |
+| Action                                             | PC      | Xbox    | PlayStation |
+|----------------------------------------------------|---------|---------|-------------|
+| Head-to-head                                       | **Tab** | **LB**  | **L1**      |
+| Session stats / MMR graph                          | **F12** | —       | —           |
+| Toggle expanded H2H *or* swap session ↔ graph      | **F11** | —       | —           |
+| Cycle MMR category *or* graph playlist             | **F10** | —       | —           |
 
 Hold to show; release to hide. Multiple bindings can be combined; the overlay shows while *any* of them is held.
 
-**F11** toggles whether the H2H overlay also shows the session stats card underneath. The choice persists across launches (saved to `config.json`).
+**F11** is context-sensitive:
+- While **Tab** is held (or nothing is held): toggles whether the H2H card also shows the session stats below. The choice persists across launches.
+- While **F12** is held: swaps the session card to a **MMR graph** view of your last 30 ranked matches for the selected playlist, with W/L markers, faint rank-zone bands behind the line, and your net MMR delta over the visible window. Same key, second press → back to the session card.
+
+**F10** is also context-sensitive:
+- In the **H2H card**: cycles the MMR category shown next to each opponent — `best → 1v1 → 2v2 → 3v3 → best`. Active category appears in the H2H header (`MMR · BEST`) and the footer hint. Only does anything if MMR display is enabled — see below.
+- In the **graph view** (F12 held + graph open): cycles the plotted playlist — `1v1 → 2v2 → 3v3`. Active playlist shows in the graph header (`MMR · 2V2`).
+
+Both choices persist independently across launches.
+
+## MMR display
+
+Right-click the tray icon and tick **"Show MMR (sends opponent IDs to tracker.gg)"**. Off by default. Once on, every opponent's rank tier and current MMR appear under their W/L line, color-coded by rank (bronze → SSL).
+
+Defaults to "best" — the highest MMR across the three competitive playlists (1v1, 2v2, 3v3) — with a small playlist hint so you can see *which* playlist that came from. Cycle to a specific playlist with **F10**.
+
+- **Source**: `rocketleague.tracker.network`'s public JSON endpoint. No API key required.
+- **Privacy**: opponents' display names (and your own, until you exclude yourself) are sent over HTTPS to `api.tracker.gg`. The local match history, players, and config are never uploaded. Toggle off any time and the network calls stop immediately.
+- **Freshness**: tracker.network refreshes from Psyonix on demand and caches each profile for ~4 minutes server-side. We cache for 10 minutes locally (`mmr_cache.json`). MMR updates between matches with up to ~4 min lag, typically near-realtime.
+- **Throttle**: at most one outbound request every 0.5 seconds (≈ 2 req/sec). A full 3v3 lobby resolves in ~3s.
+- **Lookup limit**: the tracker indexes by display name. If a console player has just renamed (or has a name that's not unique), they'll show as `—`. Epic, PSN, Xbox, Switch, Steam are all supported in principle, but coverage depends on whether the player is registered on tracker.network.
+
+### Tracking your own MMR over time
+
+When MMR display is enabled, the script also persists your own MMR snapshots to `mmr_history.jsonl` (one line per snapshot, only when TRN's data actually advances), and after every `MatchEnded` it polls TRN every 2 minutes for up to 10 min until your snapshot rolls. That's the data feeding the graph view.
+
+The graph approximates **per-game** MMR change from the cumulative snapshots. Algorithm: between two snapshots showing a delta of *D* MMR, with *W* wins and *L* losses recorded in that window, each win contributes `+|D|/|W−L|` and each loss `−|D|/|W−L|`. Examples:
+- 2W + 1L net **+10** → step = 10 → `+10 / +10 / -10`
+- 4W + 2L net **+36** → step = 18 → `+18 / +18 / +18 / +18 / -18 / -18`
+
+When wins == losses (net zero), the step is the rolling median of past intervals' steps so deep-season MMR (which barely moves) still produces a sensible chart. The line is also reconciled to the actual snapshot value at every interval boundary, so rounding can't drift off truth.
+
+> **Ranked vs casual**: per-game points are derived, not exact. The Rocket League Stats API doesn't expose queue type ([audited](rl_api_text.md)), so if you mix ranked and casual matches in the same ~5-minute snapshot window, the MMR delta is split across all of them — a casual win in the middle of a ranked session will get credited a small "+MMR" it didn't actually earn. Snapshot boundaries always reconcile to the truth, so the totals stay correct.
+
+To wipe the graph data: delete `mmr_history.jsonl` next to the script.
 
 ## Config
 
 Settings live in `config.json` (created on first run). The file is **gitignored**, so `git pull` never overwrites your local edits. When new options are added in a future version, your existing values are preserved and only the new keys are merged in. The top of the file has comments listing every supported keyboard and gamepad key name. Common tweaks:
 
-- `hotkeys` / `session_hotkeys` — lists of triggers, e.g. `["tab", "pad_lb"]`. Avoid D-pad bindings — stock RL maps them to quickchat.
+- `hotkeys` / `session_hotkeys` / `expand_hotkeys` / `cycle_hotkeys` — lists of triggers, e.g. `["tab", "pad_lb"]`. Avoid D-pad bindings — stock RL maps them to quickchat.
 - `position` — `top-right` (default), `top-left`, `top-center`, `bottom-right`, `bottom-left`
 - `require_rl_focus` — set to `false` to also show the overlay on the desktop
 - `self_player_id` — auto-filled after your first 1v1; set manually if you only play 2v2/3v3 (copy your `Platform|Uid` from `players.json`)
+- `mmr_enabled` — `true` enables opponent MMR lookup against tracker.network. Off by default; flip via the tray menu so you see the privacy note.
+- `mmr_category` — `"best" | "1v1" | "2v2" | "3v3"`. Cycled live with **F10**.
 
-To wipe your match history, delete `matches.jsonl` and `players.json`.
+To wipe your match history, delete `matches.jsonl` and `players.json`. To wipe the MMR graph data, delete `mmr_history.jsonl`.
 
 ## Privacy
 
-Everything runs locally. `matches.jsonl`, `players.json`, and `config.json` never leave your machine — they're written next to the script. The script connects to `127.0.0.1:49123` only; no remote network calls anywhere in the code. The data is yours.
+By default everything runs locally. `matches.jsonl`, `players.json`, `mmr_cache.json`, and `config.json` never leave your machine — they're written next to the script. The script connects to `127.0.0.1:49123` only; no remote network calls happen unless **you opt into one** of the two features below.
+
+- **MMR display** (off by default — tray menu toggle). When enabled, the script sends each opponent's display name to `api.tracker.gg` over HTTPS to look up their public Rocket League profile. Your own player record is excluded from the lookup. Caches are local. Toggle off and the calls stop immediately.
+- **Auto-update** (off by default — tray menu toggle). When enabled, `start.bat` checks GitHub for a newer version of this script.
+
+The data is yours.
 
 ## Updates
 
@@ -132,6 +174,8 @@ The setting persists in `config.json` (`auto_update: true|false`). Launching wit
 - **Tray icon missing.** Windows hides newly-installed tray icons behind the chevron `^` next to the clock by default. Click the chevron, drag the Rocket League H2H icon onto the taskbar to pin it. Or: Settings → Personalization → Taskbar → Other system tray icons → enable `pythonw.exe`.
 - **Gamepad bindings silently ignored.** The `inputs` package needs to be installed (`pip install -r requirements.txt`). The console will say `[hotkey] gamepad listener watching: [...]` on startup if it's working.
 - **Port 49123 already in use.** Pick a different port in `DefaultStatsAPI.ini` *and* in `config.json` (`"port": 49123`) — they must match.
+- **MMR shows `—` for an opponent you can see in-game.** tracker.network indexes by display name. Console players who renamed recently, or who have a non-unique handle that collides with someone else, may not resolve. There is no way around this short of TRN updating their database. Epic players' MMR usually works because Epic display names are unique on the platform.
+- **MMR shows `…` and never resolves.** Either `curl_cffi` failed to install (re-run `pip install -r requirements.txt`) or `api.tracker.gg` is unreachable. Open `mmr.log` next to the script — every fetch, skip, and error gets logged there with timestamps. (`start.bat` uses `pythonw` which has no console window, so the log file is the source of truth.)
 
 ## License
 

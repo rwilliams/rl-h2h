@@ -321,3 +321,14 @@ Supersonic threshold ≈ `2200` UU/s.
 - **What's NOT in the API**: MMR, rank, division, playlist/queue type, party
   composition, replay file path. For MMR you have to scrape Tracker Network
   by `PrimaryId`.
+- **Audit (2026-05-02)**: dumped every envelope verbatim during a casual 1v1
+  AND a ranked 1v1, then diffed. Every field matches between modes — no
+  undocumented queue-type field exists. Verified absent across
+  `MatchCreated`, `MatchInitialized`, `CountdownBegin`, `RoundStarted`,
+  `UpdateState.{Game,Players,Teams}`, `BallHit`, `StatfeedEvent`,
+  `GoalScored`, `CrossbarHit`, `ClockUpdatedSeconds`, `MatchEnded`,
+  `MatchDestroyed`. Every event carries `MatchGuid` plus its event-specific
+  payload — nothing else identifies playlist or ranked-vs-casual. Per-game
+  MMR attribution therefore can't disambiguate ranked from casual matches
+  played in the same TRN snapshot window from API data alone; either rely on
+  a manual user toggle or infer from MMR-motion correlation.
