@@ -34,7 +34,8 @@ GAMEPAD_BUTTONS = {
 GAMEPAD_TRIGGER_THRESHOLD = 80  # 0..255
 
 
-# Cached Win32 bindings for is_rl_focused — hoisted to avoid re-loading WinDLL each poll.
+# Cached Win32 bindings for is_rl_focused and the menu LL hook — hoisted to
+# avoid re-loading WinDLL each poll.
 if sys.platform == "win32":
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -46,8 +47,54 @@ if sys.platform == "win32":
         wintypes.HANDLE, wintypes.DWORD, ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD)
     ]
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    # WH_KEYBOARD_LL hook plumbing for MenuHotkeyListener.
+    _HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    )
+    _user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, _HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+    _user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    _user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    _user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    _user32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    _user32.CallNextHookEx.restype = ctypes.c_long
+    _user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    _user32.GetMessageW.restype = ctypes.c_int
+    _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.PostThreadMessageW.argtypes = [
+        wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    _user32.PostThreadMessageW.restype = wintypes.BOOL
+    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 else:
     _user32 = _kernel32 = None  # type: ignore[assignment]
+    _HOOKPROC = None  # type: ignore[assignment]
+
+
+# Constants for the LL keyboard hook.
+_WH_KEYBOARD_LL = 13
+_HC_ACTION = 0
+_WM_KEYDOWN = 0x0100
+_WM_KEYUP = 0x0101
+_WM_SYSKEYDOWN = 0x0104
+_WM_SYSKEYUP = 0x0105
+_WM_QUIT = 0x0012
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
 
 
 def is_rl_focused() -> bool:
@@ -275,16 +322,20 @@ def _name_to_vk(name: Optional[str]) -> Optional[int]:
 class MenuHotkeyListener(QObject):
     """Keyboard listener for the in-game settings menu.
 
-    On Windows, uses pynput's ``win32_event_filter`` to selectively suppress
-    the menu key (always, when menu isn't capturing) and the nav keys
-    (↑/↓/Enter, only while the menu is open and not in rebind capture). The
-    suppression prevents Rocket League from also reacting to those presses
-    — without it, Enter would also trigger RL's UI confirm, etc.
+    On Windows, installs its own ``WH_KEYBOARD_LL`` hook (via ctypes) so we
+    can selectively suppress events at the OS level. We can't use pynput
+    here: its ``win32_event_filter`` runs after the hook callback returns,
+    so its return value can't actually stop event propagation.
 
-    On non-Windows platforms there's no suppression hook in pynput's stable
-    API; we fall back to a regular listener that dispatches signals but lets
-    keys pass through to the foreground app. Suppression matters for
-    in-game use (Windows-only), so the macOS dev path is fine.
+    Suppression rules:
+      - Menu key: suppressed on every press (and auto-repeat) except while
+        a rebind is in progress, so it doesn't double-trigger anything in
+        Rocket League.
+      - ↑ / ↓ / Enter: suppressed only while the menu is visible and we're
+        not in capture mode. Otherwise they pass through to RL as normal.
+
+    On non-Windows we fall back to a non-suppressing pynput listener — the
+    macOS dev path doesn't need suppression to be useful.
     """
 
     toggle = Signal()
@@ -292,90 +343,110 @@ class MenuHotkeyListener(QObject):
     down = Signal()
     enter = Signal()
 
-    # Windows hook message types. We only emit on key-down (and only on the
-    # down-edge — the LL hook receives auto-repeat WM_KEYDOWN events too,
-    # which would otherwise flicker the menu open/closed on a held key).
-    _WM_KEYDOWN = 0x0100
-    _WM_KEYUP = 0x0101
-    _WM_SYSKEYDOWN = 0x0104
-    _WM_SYSKEYUP = 0x0105
-
     def __init__(self, menu_key_cb, is_visible_cb, is_capturing_cb):
         super().__init__()
         self._menu_key_cb = menu_key_cb
         self._is_visible_cb = is_visible_cb
         self._is_capturing_cb = is_capturing_cb
         self._held: set[int] = set()
-        if sys.platform == "win32":
-            self._listener = keyboard.Listener(
-                on_press=lambda k: None,
-                on_release=lambda k: None,
-                win32_event_filter=self._win32_filter,
-            )
+        self._hook = None
+        self._thread = None
+        self._thread_id = 0
+        # Holding a reference to the WINFUNCTYPE'd callback is required —
+        # ctypes won't keep it alive otherwise and Windows would call into
+        # freed memory on the next keypress.
+        self._proc = None
+        if sys.platform != "win32":
+            self._fallback = keyboard.Listener(on_press=self._on_press_fallback)
         else:
-            self._listener = keyboard.Listener(on_press=self._on_press_generic)
+            self._fallback = None
 
     def start(self) -> None:
-        self._listener.start()
+        if sys.platform == "win32":
+            self._proc = _HOOKPROC(self._win_handler)
+            self._thread = threading.Thread(
+                target=self._run_hook, daemon=True, name="MenuLLHook",
+            )
+            self._thread.start()
+        else:
+            self._fallback.start()
 
     def stop(self) -> None:
-        self._listener.stop()
+        if sys.platform == "win32":
+            if self._thread_id:
+                _user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+        elif self._fallback is not None:
+            self._fallback.stop()
 
-    @staticmethod
-    def _vk_of(data) -> int:
-        """Read vkCode out of pynput's KBDLLHOOKSTRUCT (field name varies
-        across pynput versions: vk_code in modern, vkCode in older)."""
-        return getattr(data, "vk_code", None) or getattr(data, "vkCode", 0)
+    def _run_hook(self) -> None:
+        self._thread_id = _kernel32.GetCurrentThreadId()
+        self._hook = _user32.SetWindowsHookExW(_WH_KEYBOARD_LL, self._proc, None, 0)
+        if not self._hook:
+            err = ctypes.get_last_error()
+            print(f"[hotkey] menu LL hook install failed (error {err})",
+                  file=sys.stderr)
+            return
+        try:
+            msg = wintypes.MSG()
+            while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            _user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
 
-    def _win32_filter(self, msg, data) -> bool:
-        vk = self._vk_of(data)
-        if msg in (self._WM_KEYUP, self._WM_SYSKEYUP):
-            self._held.discard(vk)
-            return True
-        if msg not in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN):
-            return True
-        # Down-edge only: the LL hook fires WM_KEYDOWN for every auto-repeat.
-        if vk in self._held:
-            # Still suppress repeats for keys we'd suppress on the down-edge,
-            # otherwise RL would see only the repeats.
-            menu_vk_now = _name_to_vk(self._menu_key_cb())
-            if vk == menu_vk_now and not self._is_capturing_cb():
-                return False
-            if self._is_visible_cb() and not self._is_capturing_cb() and vk in (
-                _VK_BY_NAME["up"], _VK_BY_NAME["down"], _VK_BY_NAME["enter"],
-            ):
-                return False
-            return True
-        self._held.add(vk)
+    def _win_handler(self, n_code, w_param, l_param):
+        if n_code == _HC_ACTION:
+            try:
+                kb = ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                vk = int(kb.vkCode)
+                msg = int(w_param)
+                if msg in (_WM_KEYUP, _WM_SYSKEYUP):
+                    self._held.discard(vk)
+                elif msg in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
+                    if self._handle_keydown(vk):
+                        return 1  # suppress
+            except Exception as e:
+                print(f"[hotkey] menu hook error: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+        return _user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
+
+    def _handle_keydown(self, vk: int) -> bool:
+        """Decide whether to suppress this keydown. Emits Qt signals on the
+        leading edge (auto-repeats are silently swallowed but not re-emitted,
+        otherwise holding ↓ would scroll the menu at the OS key-repeat rate)."""
         capturing = self._is_capturing_cb()
         visible = self._is_visible_cb()
         menu_vk = _name_to_vk(self._menu_key_cb())
+        is_repeat = vk in self._held
+        self._held.add(vk)
 
         if menu_vk is not None and vk == menu_vk:
-            # During capture, the menu key is being captured as a new
-            # binding — let it propagate so capture_next_input's listener
-            # sees it and so the user gets a chance to cancel via Esc.
+            # During capture, the menu key is being captured as the new
+            # binding — let it through to capture_next_input's listener.
             if capturing:
-                return True
-            self.toggle.emit()
-            return False  # suppress so RL doesn't also see the press
-
-        if not visible or capturing:
+                return False
+            if not is_repeat:
+                self.toggle.emit()
             return True
 
-        if vk == _VK_BY_NAME["up"]:
-            self.up.emit()
+        if not visible or capturing:
             return False
-        if vk == _VK_BY_NAME["down"]:
-            self.down.emit()
-            return False
-        if vk == _VK_BY_NAME["enter"]:
-            self.enter.emit()
-            return False
-        return True
 
-    def _on_press_generic(self, key) -> None:
-        # Non-Windows fallback: dispatch but don't suppress.
+        nav = (
+            (_VK_BY_NAME["up"], self.up),
+            (_VK_BY_NAME["down"], self.down),
+            (_VK_BY_NAME["enter"], self.enter),
+        )
+        for nav_vk, sig in nav:
+            if vk == nav_vk:
+                if not is_repeat:
+                    sig.emit()
+                return True
+        return False
+
+    def _on_press_fallback(self, key) -> None:
+        # Non-Windows: dispatch but don't suppress.
         name = _kb_event_name(key)
         if name is None:
             return
