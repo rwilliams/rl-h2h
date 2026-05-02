@@ -6,15 +6,17 @@ cd /d "%~dp0"
 REM Self-update: silent, ~1s, never blocks the launch on failure.
 where python >nul 2>&1 && python "%~dp0updater.py" 2>nul
 
+set "PYTHONPATH=%~dp0src"
+
 where pythonw >nul 2>&1
 if %errorlevel%==0 (
-    start "" pythonw rl_h2h.py
+    start "" pythonw -m rl_h2h
     exit /b
 )
 
 where py >nul 2>&1
 if %errorlevel%==0 (
-    start "" py -w rl_h2h.py
+    start "" py -w -m rl_h2h
     exit /b
 )
 

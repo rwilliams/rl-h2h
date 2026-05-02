@@ -1,19 +1,6 @@
-# User data — generated at runtime, do not commit
-config.json
-config.json.tmp
-matches.jsonl
-matches.jsonl.bak-*
-players.json
-players.json.tmp
-players.corrupt-*.json
-mmr_cache.json
-mmr_cache.json.bak-*
-mmr_history.jsonl
-mmr_history.jsonl.bak-*
-VERSION.tree.json
-
-# Local-only test helper (per-machine simulator, never shipped)
-simulate_mmr.py
+# Runtime data + logs
+data/
+logs/
 
 # Python
 __pycache__/
@@ -35,7 +22,9 @@ dist/
 .obsidian/
 .DS_Store
 Thumbs.db
-*.log
 
 # Scratch / tooling
 .playwright-mcp/
+
+# Updater bookkeeping
+VERSION.tree.json
