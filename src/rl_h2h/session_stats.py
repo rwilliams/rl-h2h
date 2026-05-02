@@ -334,7 +334,7 @@ def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
         f"<b>{s.losses}</b>"
         f" <span style='color:{colors.C_MUTED};font-weight:500;'>({win_pct:.0f}%)</span>"
         if s.matches
-        else f"<span style='color:{colors.C_MUTED};'>—</span>"
+        else colors.EM_DASH
     )
 
     if s.win_streak >= 2:
@@ -342,11 +342,11 @@ def render_session_html(s: SessionStats, with_legend: bool = True) -> str:
     elif s.loss_streak >= 2:
         streak_val = f"<span style='color:{colors.C_LOSS};font-weight:700;'>L{s.loss_streak}</span>"
     else:
-        streak_val = f"<span style='color:{colors.C_MUTED};'>—</span>"
+        streak_val = colors.EM_DASH
 
     goals_val = (
         f"{s.goals_for}<span style='color:{colors.C_MUTED};'>&ndash;</span>{s.goals_against}"
-        if s.matches else f"<span style='color:{colors.C_MUTED};'>—</span>"
+        if s.matches else colors.EM_DASH
     )
     diff = s.goals_for - s.goals_against
     if diff != 0:

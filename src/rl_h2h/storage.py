@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .constants import BUCKET_VS, BUCKET_WITH
-from .paths import MATCHES_PATH, PLAYERS_PATH, atomic_write_text
+from .paths import MATCHES_PATH, PLAYERS_PATH, load_jsonl, safe_atomic_write_text
 
 
 def player_key(primary_id: str) -> str:
@@ -33,7 +33,7 @@ def load_players() -> dict:
 
 
 def save_players(players: dict) -> None:
-    atomic_write_text(PLAYERS_PATH, json.dumps(players, indent=2, sort_keys=True))
+    safe_atomic_write_text(PLAYERS_PATH, json.dumps(players, indent=2, sort_keys=True), "players")
 
 
 def append_match(record: dict) -> None:
@@ -60,23 +60,7 @@ def match_playlist(record: dict) -> str:
 
 
 def load_matches() -> list[dict]:
-    """Parse matches.jsonl. Skips malformed lines silently."""
-    if not MATCHES_PATH.exists():
-        return []
-    out = []
-    try:
-        with MATCHES_PATH.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError as e:
-        print(f"[matches] read failed: {e}", file=sys.stderr)
-    return out
+    return load_jsonl(MATCHES_PATH, "matches")
 
 
 def update_players_cache(players: dict, match: dict) -> None:

@@ -8,6 +8,7 @@ from . import colors
 from .arenas import pretty_arena
 from .constants import BUCKET_VS, BUCKET_WITH
 from .mmr import tier_color
+from .paths import parse_iso
 from .session_stats import session_has_split
 
 
@@ -45,15 +46,12 @@ def idle_html(message: str) -> str:
 
 
 def humanize_when(iso_ts: Optional[str]) -> str:
-    if not iso_ts:
+    t = parse_iso(iso_ts)
+    if t is None:
         return ""
-    try:
-        t = datetime.fromisoformat(iso_ts)
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        secs = int((datetime.now(timezone.utc) - t).total_seconds())
-    except (ValueError, TypeError):
-        return ""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    secs = int((datetime.now(timezone.utc) - t).total_seconds())
     if secs < 60:
         return "just now"
     if secs < 3600:

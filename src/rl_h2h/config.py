@@ -5,7 +5,7 @@ import json
 import sys
 from typing import Optional
 
-from .paths import CONFIG_PATH, atomic_write_text
+from .paths import CONFIG_PATH, safe_atomic_write_text
 
 
 DEFAULT_CONFIG = {
@@ -119,10 +119,7 @@ DEFAULT_CONFIG = {
 
 def save_config(cfg: dict) -> None:
     out = {k: v for k, v in cfg.items() if k != "hotkey"}
-    try:
-        atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2))
-    except OSError as e:
-        print(f"[config] could not save: {e}", file=sys.stderr)
+    safe_atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2), "config")
 
 
 def load_config() -> dict:
@@ -146,8 +143,5 @@ def load_config() -> dict:
     needs_rewrite = (loaded is None) or any(k not in loaded for k in DEFAULT_CONFIG)
     if needs_rewrite:
         out = {k: cfg[k] for k in cfg if k != "hotkey"}
-        try:
-            atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2))
-        except Exception as e:
-            print(f"[config] could not rewrite {CONFIG_PATH}: {e}", file=sys.stderr)
+        safe_atomic_write_text(CONFIG_PATH, json.dumps(out, indent=2), "config")
     return cfg

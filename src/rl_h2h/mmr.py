@@ -26,7 +26,14 @@ from PySide6.QtCore import QObject, Signal
 
 from . import colors
 from .applog import mmr_log
-from .paths import MMR_CACHE_PATH, MMR_HISTORY_PATH, atomic_write_text, now_iso
+from .paths import (
+    MMR_CACHE_PATH,
+    MMR_HISTORY_PATH,
+    load_jsonl,
+    now_iso,
+    parse_iso,
+    safe_atomic_write_text,
+)
 from .storage import match_playlist, player_key
 
 
@@ -48,20 +55,6 @@ MMR_PLAYLIST_IDS = {
 MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3")
 RANKED_PLAYLISTS = ("1v1", "2v2", "3v3")  # cycled by F10 in graph view; iterated for self-MMR logging
 
-# Standard RL rank colors. Tier strings come from TRN as "Bronze I", "Diamond III",
-# "Grand Champion II", etc. — we match on the prefix word.
-MMR_TIER_COLORS = {
-    "Unranked":         "#8E9379",
-    "Bronze":           "#B87333",
-    "Silver":           "#C0C5CD",
-    "Gold":             "#F0C674",
-    "Platinum":         "#6FC8D6",
-    "Diamond":          "#7FA9F2",
-    "Champion":         "#B59CEE",
-    "Grand Champion":   "#EC4F50",
-    "Supersonic Legend": "#DB2C70",
-}
-
 # Tier MMR ranges (RL Season 36 ranges, approximate). Anything below the
 # bottom is Bronze; anything above the top is SSL. Used by the graph view.
 MMR_RANK_ZONES = [
@@ -74,6 +67,11 @@ MMR_RANK_ZONES = [
     (1195, 1565, "Grand Champion",     "#EC4F50"),
     (1565, 2500, "Supersonic Legend",  "#DB2C70"),
 ]
+
+# Standard RL rank colors. Tier strings come from TRN as "Bronze I", "Diamond III",
+# "Grand Champion II", etc. — we match on the prefix word. Derived from
+# MMR_RANK_ZONES with an explicit Unranked entry (zones cover ranked play only).
+MMR_TIER_COLORS = {"Unranked": "#8E9379", **{name: color for _lo, _hi, name, color in MMR_RANK_ZONES}}
 
 MMR_TTL_SECONDS = 600   # local cache freshness — TRN's own TTL is 4 min
 # Min seconds between outbound TRN requests. TRN's median latency is ~500ms,
@@ -168,10 +166,7 @@ def load_mmr_cache() -> dict:
 
 
 def save_mmr_cache(cache: dict) -> None:
-    try:
-        atomic_write_text(MMR_CACHE_PATH, json.dumps(cache, indent=2, sort_keys=True))
-    except OSError as e:
-        print(f"[mmr] failed to write cache: {e}", file=sys.stderr)
+    safe_atomic_write_text(MMR_CACHE_PATH, json.dumps(cache, indent=2, sort_keys=True), "mmr")
 
 
 def append_mmr_history(entry: dict) -> None:
@@ -184,23 +179,7 @@ def append_mmr_history(entry: dict) -> None:
 
 
 def load_mmr_history() -> list[dict]:
-    """Parse mmr_history.jsonl into a list, in file order. Skips malformed lines."""
-    if not MMR_HISTORY_PATH.exists():
-        return []
-    out = []
-    try:
-        with MMR_HISTORY_PATH.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError as e:
-        print(f"[mmr-history] read failed: {e}", file=sys.stderr)
-    return out
+    return load_jsonl(MMR_HISTORY_PATH, "mmr-history")
 
 
 class MMRClient(QObject):
@@ -231,6 +210,16 @@ class MMRClient(QObject):
         self._enabled = bool(enabled)
         self._ttl = max(60, int(ttl_seconds))
         self._cache: dict = load_mmr_cache()
+        # Steam negative-cache entries from before the SteamID lookup fix were
+        # likely false negatives (display-name 404s). Drop them once at startup
+        # so we re-fetch with the SteamID instead of waiting out the 10 min TTL.
+        steam_nf = [k for k, v in self._cache.items()
+                    if isinstance(v, dict) and v.get("not_found") and k.startswith("Steam|")]
+        if steam_nf:
+            for k in steam_nf:
+                del self._cache[k]
+            save_mmr_cache(self._cache)
+            mmr_log(f"purged {len(steam_nf)} stale Steam not_found entries (re-fetch with SteamID)")
         self._cache_lock = threading.Lock()
         self._queue: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
         self._inflight: set[str] = set()
@@ -400,15 +389,6 @@ class MMRClient(QObject):
                 f"best={best.get('mmr')}@{best.get('playlist')} "
                 f"trn_lastUpdated={entry.get('lastUpdated')}")
         self.updated.emit(key)
-
-
-def parse_iso(ts: Optional[str]) -> Optional[datetime]:
-    if not isinstance(ts, str) or not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts)
-    except ValueError:
-        return None
 
 
 def attribute_mmr_points(playlist: str, snapshots: list[dict],
