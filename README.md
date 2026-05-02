@@ -2,6 +2,8 @@
 
 A small Python overlay that connects to Rocket League's local Stats API, tracks your match history, and shows a transparent always-on-top card with per-opponent W/L records and live session stats.
 
+![Head-to-head overlay with MMR enabled](docs/screenshots/mmr_readme.png)
+
 > Runs on **Windows**. The Rocket League Stats API is Windows-only.
 
 ## Setup
@@ -108,7 +110,7 @@ Both choices persist independently across launches.
 
 Press **F5** in-game to open a small settings panel inside the overlay. Press F5 again to close. Navigate with **↑/↓**, **Enter** to toggle a setting or rebind a key, **Esc** to cancel a rebind.
 
-![Settings menu](docs/screenshots/menu.png)
+![Settings menu](docs/screenshots/settings_readme.png)
 
 The menu lets you change two kinds of things without alt-tabbing out of Rocket League:
 
@@ -116,6 +118,14 @@ The menu lets you change two kinds of things without alt-tabbing out of Rocket L
 - **Bindings** — H2H hold, Session, Expand, Cycle MMR, and the menu key itself. Each action keeps **one keyboard slot + one gamepad slot**. Press a keyboard key during capture → the kb slot is replaced; press a gamepad button → the pad slot is replaced; the other slot is left alone. Changes apply live, no restart.
 
 The menu key itself is keyboard-only (a gamepad button would too easily open it mid-game). While the menu is open, ↑/↓/Enter are intercepted at the OS level so they don't also reach Rocket League's UI.
+
+## Post-match summary
+
+When a match ends, a card flashes the result and your per-match stats — saves, shots, demos, and a few "fun" extras like fastest goal and hardest crossbar — alongside the opponent's numbers. Auto-hides when the next match starts.
+
+![Post-match summary card](docs/screenshots/summary_readme.png)
+
+Toggle it on/off from the **F5** menu (`Auto match summary`) or `show_match_summary` in `data/config.json`.
 
 ## MMR display
 
@@ -131,7 +141,9 @@ Defaults to "best" — the highest MMR across the three competitive playlists (1
 
 ### Tracking your own MMR over time
 
-When MMR display is enabled, the script also persists your own MMR snapshots to `data/mmr_history.jsonl` (one line per snapshot, only when TRN's data actually advances), and after every `MatchEnded` it polls TRN every 2 minutes for up to 10 min until your snapshot rolls. That's the data feeding the graph view.
+When MMR display is enabled, the script also persists your own MMR snapshots to `data/mmr_history.jsonl` (one line per snapshot, only when TRN's data actually advances), and after every `MatchEnded` it polls TRN every 2 minutes for up to 10 min until your snapshot rolls. That's the data feeding the graph view (hold **F8**, then **F7** to swap from the session card to the graph).
+
+![MMR graph view](docs/screenshots/graph_readme.png)
 
 The graph approximates **per-game** MMR change from the cumulative snapshots. Algorithm: between two snapshots showing a delta of *D* MMR, with *W* wins and *L* losses recorded in that window, each win contributes `+|D|/|W−L|` and each loss `−|D|/|W−L|`. Examples:
 - 2W + 1L net **+10** → step = 10 → `+10 / +10 / -10`
