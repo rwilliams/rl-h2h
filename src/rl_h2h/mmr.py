@@ -53,7 +53,7 @@ MMR_PLAYLIST_IDS = {
     13: "3v3",
 }
 MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3")
-RANKED_PLAYLISTS = ("1v1", "2v2", "3v3")  # cycled by F10 in graph view; iterated for self-MMR logging
+RANKED_PLAYLISTS = ("1v1", "2v2", "3v3")  # cycled by the cycle hotkey in graph view; iterated for self-MMR logging
 
 # Tier MMR ranges (RL Season 36 ranges, approximate). Anything below the
 # bottom is Bronze; anything above the top is SSL. Used by the graph view.

@@ -19,7 +19,7 @@ from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history
 from .overlay import Overlay
 from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
 from .render_h2h import h2h_footer_html, idle_html, render_html, session_footer_html
-from .render_summary import render_summary_html
+from .render_summary import render_match_stats_html, render_summary_html
 from .session_stats import MatchStats, SessionStats, render_session_html
 from .stats_client import StatsClient
 from .storage import (
@@ -126,19 +126,19 @@ def main():
                 )
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
+                # Expanded H2H shows current-match stats (saves/shots/demos/etc.).
+                # Session aggregates live behind the session-hotkey view instead —
+                # they aren't actionable mid-match.
+                match_body = render_match_stats_html(match_stats)
                 spacer = (
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
                     "<tr><td height='28'>&nbsp;</td></tr></table>"
-                )
-                # In expanded mode we render the session WITHOUT its own Format legend
-                # and recombine it (along with the hotkey hint) into a single-table
-                # footer below — that way the two metadata rows are siblings inside
-                # one table and Qt can't slip native block spacing between them.
+                ) if match_body else ""
                 overlay.set_html(
                     state["h2h_html"]
                     + spacer
-                    + render_session_html(session, with_legend=False)
-                    + h2h_footer_html(cfg, expanded=True, session=session)
+                    + match_body
+                    + h2h_footer_html(cfg, expanded=True, session=None)
                 )
             else:
                 overlay.set_html(
@@ -313,7 +313,7 @@ def main():
         # Reset per-match aggregator using the now-known self_name.
         match_stats.reset(self_name=session.self_name)
         # Persist roster bits we need to re-render asynchronously when MMR
-        # data trickles in (or when the user toggles category via F10).
+        # data trickles in (or when the user toggles category via the cycle key).
         state["roster"] = payload["players"]
         state["my_team"] = payload["myTeam"]
         state["arena"] = payload["arena"]
@@ -411,9 +411,9 @@ def main():
     hotkey_session.released.connect(on_session_released)
 
     def toggle_expand():
-        # Context-sensitive: when F12 is held, F11 swaps the session sub-view
-        # between session card and graph. Otherwise (Tab held or nothing
-        # held), it keeps the existing H2H-expand toggle behavior.
+        # Context-sensitive: when the session key is held, the expand key swaps
+        # the session sub-view between session card and graph. Otherwise (Tab
+        # held or nothing held), it keeps the existing H2H-expand toggle behavior.
         if state["session_held"]:
             nxt = "graph" if state["session_view"] == "session" else "session"
             state["session_view"] = nxt
@@ -430,10 +430,10 @@ def main():
     hotkey_expand.pressed.connect(toggle_expand)
 
     def cycle_mmr_category():
-        # Context-sensitive: while the graph view is showing (F12 held +
-        # session_view=="graph"), F10 cycles the graph's playlist instead of
-        # the H2H MMR category. Same key, different role per context — same
-        # idea as F11 (expand H2H vs swap session subview).
+        # Context-sensitive: while the graph view is showing (session-key held
+        # + session_view=="graph"), the cycle key cycles the graph's playlist
+        # instead of the H2H MMR category. Same key, different role per context
+        # — same idea as the expand key (expand H2H vs swap session subview).
         if state["session_held"] and state["session_view"] == "graph":
             cur_pl = state["graph_playlist"]
             i = RANKED_PLAYLISTS.index(cur_pl) if cur_pl in RANKED_PLAYLISTS else -1
@@ -441,7 +441,7 @@ def main():
             state["graph_playlist"] = nxt_pl
             cfg["graph_playlist"] = nxt_pl
             save_config(cfg)
-            mmr_log(f"F10 cycle_graph_playlist: {cur_pl!r} -> {nxt_pl!r}")
+            mmr_log(f"cycle_graph_playlist: {cur_pl!r} -> {nxt_pl!r}")
             update_overlay()
             return
         cur = cfg.get("mmr_category", "best")
@@ -452,7 +452,7 @@ def main():
         nxt = MMR_CATEGORIES[(i + 1) % len(MMR_CATEGORIES)]
         cfg["mmr_category"] = nxt
         save_config(cfg)
-        mmr_log(f"F10 cycle_category: {cur!r} -> {nxt!r}")
+        mmr_log(f"cycle_category: {cur!r} -> {nxt!r}")
         rerender_h2h()
         update_overlay()
 
@@ -464,7 +464,7 @@ def main():
 
     # Lazy cache for mmr_history.jsonl. We don't load at startup — the graph
     # view is opened by maybe 1% of users on any given session, so we pay the
-    # parse cost only on first F11-from-session. The `dirty` flag is set by
+    # parse cost only on first expand-from-session. The `dirty` flag is set by
     # _log_my_mmr after a history append, telling the graph render to reparse
     # before drawing. mtime-based invalidation also guards against external
     # edits.
