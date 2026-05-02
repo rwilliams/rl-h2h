@@ -12,6 +12,53 @@ from .session_stats import (
 )
 
 
+def render_match_stats_html(ms: MatchStats) -> str:
+    """Body-only render of per-match stats (PLAY / ACTIVITY / FUN sections).
+
+    Used both by the auto-popup match summary and by the in-game expanded H2H
+    overlay so the same numbers show in both places. Returns an empty string
+    when nothing has happened yet — caller decides whether to render a divider.
+    """
+    play_rows = []
+    if ms.saves:     play_rows.append(stat_row("Saves",     pair_count(ms.saves, ms.saves_self, always_pair=True)))
+    if ms.shots:     play_rows.append(stat_row("Shots",     pair_count(ms.shots, ms.shots_self, always_pair=True)))
+    if ms.demos:     play_rows.append(stat_row("Demos",     pair_count(ms.demos, ms.demos_self, always_pair=True)))
+    if ms.demoed_self:
+        play_rows.append(stat_row("Demoed",    str(ms.demoed_self)))
+    if ms.crossbars: play_rows.append(stat_row("Crossbars", pair_count(ms.crossbars, ms.crossbars_self, always_pair=True)))
+
+    # ACTIVITY: derived from UpdateState ticks. Boost-used is summed from
+    # Boost-percentage drops at ~2 Hz, so prefix with ~ to flag the approximation.
+    activity_rows = []
+    b_scope, b_self = ms.boost_used_leader()
+    if b_scope:
+        activity_rows.append(stat_row("Boost used", f"~{b_scope}{colors.PAIR_SEP}~{b_self}"))
+
+    fun_rows = []
+    if ms.max_goal_speed > 0:
+        fun_rows.append(stat_row("Max goal speed",   pair_max(ms.max_goal_speed, ms.max_goal_speed_self, always_pair=True)))
+    if ms.max_ball_speed > 0:
+        fun_rows.append(stat_row("Max ball speed",   pair_max(ms.max_ball_speed, ms.max_ball_speed_self, always_pair=True)))
+    if ms.max_impact_force > 0:
+        fun_rows.append(stat_row("Hardest crossbar",
+                                 pair_max(ms.max_impact_force, ms.max_impact_force_self, always_pair=True)))
+    if ms.fastest_goal_time is not None:
+        fun_rows.append(stat_row("Fastest goal",
+                                 pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self, always_pair=True)))
+    if ms.own_goals > 0:
+        fun_rows.append(stat_row("Own goals",
+                                 pair_count(ms.own_goals, ms.own_goals_self, always_pair=True)))
+
+    body = ""
+    if play_rows:
+        body += stat_section("PLAY", play_rows)
+    if activity_rows:
+        body += stat_section("ACTIVITY", activity_rows)
+    if fun_rows:
+        body += stat_section("FUN", fun_rows)
+    return body
+
+
 def render_summary_html(payload: dict, ms: MatchStats) -> str:
     my_team = payload.get("myTeam")
     winner = payload.get("winner")
@@ -41,51 +88,7 @@ def render_summary_html(payload: dict, ms: MatchStats) -> str:
         "</table>"
     )
 
-    # PLAY rows: hide entirely when both match-wide and self are 0.
-    play_rows = []
-    if ms.saves:     play_rows.append(stat_row("Saves",     pair_count(ms.saves, ms.saves_self, always_pair=True)))
-    if ms.shots:     play_rows.append(stat_row("Shots",     pair_count(ms.shots, ms.shots_self, always_pair=True)))
-    if ms.demos:     play_rows.append(stat_row("Demos",     pair_count(ms.demos, ms.demos_self, always_pair=True)))
-    if ms.demoed_self:
-        play_rows.append(stat_row("Demoed",    str(ms.demoed_self)))
-    if ms.crossbars: play_rows.append(stat_row("Crossbars", pair_count(ms.crossbars, ms.crossbars_self, always_pair=True)))
-
-    # ACTIVITY rows: derived from UpdateState ticks. Touches is exact (cumulative
-    # API counter); distance and boost-used are integrated locally at ~2 Hz, so
-    # they're prefixed with ~ to flag them as approximations.
-    t_scope, t_self = ms.touches_leader()
-    d_scope, d_self = ms.distance_leader_m()
-    b_scope, b_self = ms.boost_used_leader()
-    activity_rows = []
-    if t_scope:
-        activity_rows.append(stat_row("Touches", pair_count(t_scope, t_self, always_pair=True)))
-    if d_scope:
-        activity_rows.append(stat_row("Distance", f"~{d_scope}m{colors.PAIR_SEP}~{d_self}m"))
-    if b_scope:
-        activity_rows.append(stat_row("Boost used", f"~{b_scope}{colors.PAIR_SEP}~{b_self}"))
-
-    fun_rows = []
-    if ms.max_goal_speed > 0:
-        fun_rows.append(stat_row("Max goal speed",   pair_max(ms.max_goal_speed, ms.max_goal_speed_self, always_pair=True)))
-    if ms.max_ball_speed > 0:
-        fun_rows.append(stat_row("Max ball speed",   pair_max(ms.max_ball_speed, ms.max_ball_speed_self, always_pair=True)))
-    if ms.max_impact_force > 0:
-        fun_rows.append(stat_row("Hardest crossbar",
-                                 pair_max(ms.max_impact_force, ms.max_impact_force_self, always_pair=True)))
-    if ms.fastest_goal_time is not None:
-        fun_rows.append(stat_row("Fastest goal",
-                                 pair_fastest(ms.fastest_goal_time, ms.fastest_goal_time_self, always_pair=True)))
-    if ms.own_goals > 0:
-        fun_rows.append(stat_row("Own goals",
-                                 pair_count(ms.own_goals, ms.own_goals_self, always_pair=True)))
-
-    body = ""
-    if play_rows:
-        body += stat_section("PLAY", play_rows)
-    if activity_rows:
-        body += stat_section("ACTIVITY", activity_rows)
-    if fun_rows:
-        body += stat_section("FUN", fun_rows)
+    body = render_match_stats_html(ms)
     if body:
         divider = (
             f"<div style='height:1px;background-color:{colors.C_FAINT};font-size:1px;line-height:1px;"

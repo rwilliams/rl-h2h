@@ -19,7 +19,7 @@ from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history
 from .overlay import Overlay
 from .paths import DATA_DIR, MATCHES_PATH, MMR_HISTORY_PATH, MY_MMR_LOG_PATH, PLAYERS_PATH, now_iso
 from .render_h2h import h2h_footer_html, idle_html, render_html, session_footer_html
-from .render_summary import render_summary_html
+from .render_summary import render_match_stats_html, render_summary_html
 from .session_stats import MatchStats, SessionStats, render_session_html
 from .stats_client import StatsClient
 from .storage import (
@@ -126,19 +126,19 @@ def main():
                 )
         elif state["h2h_held"] and state["in_match"]:
             if state["h2h_expanded"]:
+                # Expanded H2H shows current-match stats (saves/shots/demos/etc.).
+                # Session aggregates live behind the F12 session view instead — they
+                # aren't actionable mid-match.
+                match_body = render_match_stats_html(match_stats)
                 spacer = (
                     "<table cellpadding='0' cellspacing='0' width='100%'>"
                     "<tr><td height='28'>&nbsp;</td></tr></table>"
-                )
-                # In expanded mode we render the session WITHOUT its own Format legend
-                # and recombine it (along with the hotkey hint) into a single-table
-                # footer below — that way the two metadata rows are siblings inside
-                # one table and Qt can't slip native block spacing between them.
+                ) if match_body else ""
                 overlay.set_html(
                     state["h2h_html"]
                     + spacer
-                    + render_session_html(session, with_legend=False)
-                    + h2h_footer_html(cfg, expanded=True, session=session)
+                    + match_body
+                    + h2h_footer_html(cfg, expanded=True, session=None)
                 )
             else:
                 overlay.set_html(
