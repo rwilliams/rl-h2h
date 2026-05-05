@@ -52,7 +52,7 @@ MMR_PLAYLIST_IDS = {
     11: "2v2",
     13: "3v3",
 }
-MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3")
+MMR_CATEGORIES = ("best", "1v1", "2v2", "3v3", "peak")
 RANKED_PLAYLISTS = ("1v1", "2v2", "3v3")  # cycled by the cycle hotkey in graph view; iterated for self-MMR logging
 
 # Tier MMR ranges (RL Season 36 ranges, approximate). Anything below the
@@ -146,12 +146,29 @@ def parse_trn_payload(data: dict) -> dict:
         if best is None or p["mmr"] > best["mmr"]:
             best = {**p, "playlist": label}
 
+    # All-time peak across every playlist TRN reports a peak-rating segment
+    # for (ranked, casual, extra modes — TRN scopes the peak per playlist
+    # but tags each with the season it was set). We just want the single
+    # highest number the player has ever held.
+    peak_all_time = None
+    for seg in (data or {}).get("segments") or []:
+        if seg.get("type") != "peak-rating":
+            continue
+        pr = (seg.get("stats") or {}).get("peakRating") or {}
+        val = pr.get("value")
+        if val is None:
+            continue
+        tier_name = (pr.get("metadata") or {}).get("name") or "Unranked"
+        if peak_all_time is None or val > peak_all_time["mmr"]:
+            peak_all_time = {"mmr": int(val), "tier": tier_name}
+
     return {
         "fetched_at": now_iso(),
         "lastUpdated": last_updated,
         "handle": info.get("platformUserHandle"),
         "playlists": playlists,
         "best": best,
+        "peak_all_time": peak_all_time,
     }
 
 
