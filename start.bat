@@ -1,6 +1,7 @@
 @echo off
 REM Launches the head-to-head overlay without a console window.
 REM Place a shortcut to this file in shell:startup to auto-run with Windows.
+setlocal
 cd /d "%~dp0"
 
 REM Resolve python.exe once, then derive pythonw.exe from the SAME install.
