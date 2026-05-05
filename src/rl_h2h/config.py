@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
         "                       opponent, cached for 10 minutes). Off by default — flipping it",
         "                       on sends opponents' Platform|Uid (Epic) or display names",
         "                       (other platforms) to tracker.network. Toggle via the tray menu.",
-        "mmr_category:          which playlist's MMR to show: 'best' | '1v1' | '2v2' | '3v3'.",
+        "mmr_category:          which MMR to show: 'best' | '1v1' | '2v2' | '3v3' | 'peak'.",
         "                       Cycle live with the cycle_hotkeys key.",
         "session_view:          which sub-view session_hotkeys shows: 'session' (stats card) |",
         "                       'graph' (your MMR over time). Toggle with the expand_hotkeys",

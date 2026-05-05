@@ -71,6 +71,9 @@ def _mmr_pick(entry: Optional[dict], category: str) -> Optional[dict]:
     if category == "best":
         b = entry.get("best")
         return b if b and b.get("mmr") is not None else None
+    if category == "peak":
+        p = entry.get("peak_all_time")
+        return p if p and p.get("mmr") is not None else None
     pl = (entry.get("playlists") or {}).get(category)
     if not pl or pl.get("mmr") is None:
         return None
