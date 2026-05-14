@@ -10,6 +10,8 @@ from typing import Optional
 from PySide6.QtCore import QObject, Signal
 from pynput import keyboard
 
+from .applog import hotkey_log
+
 
 # Gamepad button name → (inputs.event_type, inputs.event_code, target_value).
 # 'thresh' for analog triggers means "treat ≥ THRESHOLD as pressed".
@@ -171,6 +173,8 @@ class HotkeyManager(QObject):
                     print(f"[hotkey] {e}", file=sys.stderr)
         self._kb_targets = kb_targets
         self._pad_targets = pad_targets
+        hotkey_log(f"_apply_bindings: kb={kb_targets} pad={pad_targets} "
+                   f"(from {hotkey_names!r})")
 
     def set_bindings(self, hotkey_names: list[str]) -> None:
         """Replace the active bindings live without restarting the listener.
@@ -212,12 +216,14 @@ class HotkeyManager(QObject):
     def _on_kb_press(self, key):
         for t in self._kb_targets:
             if self._kb_match(key, t):
+                hotkey_log(f"kb press match: {t}")
                 self._add_down(("kb",) + t)
                 return
 
     def _on_kb_release(self, key):
         for t in self._kb_targets:
             if self._kb_match(key, t):
+                hotkey_log(f"kb release match: {t}")
                 self._remove_down(("kb",) + t)
                 return
 
@@ -225,20 +231,26 @@ class HotkeyManager(QObject):
         was_empty = not self._down
         self._down.add(key_id)
         if was_empty:
+            hotkey_log(f"pressed emit (first held: {key_id})")
             self.pressed.emit()
 
     def _remove_down(self, key_id: tuple):
         self._down.discard(key_id)
         if not self._down:
+            hotkey_log(f"released emit (last released: {key_id})")
             self.released.emit()
 
     def _pad_loop(self):
         try:
             import inputs as _inputs
-        except ImportError:
+        except ImportError as e:
             print("[hotkey] gamepad bindings configured but 'inputs' is not installed. "
                   "Run: pip install inputs", file=sys.stderr)
+            hotkey_log(f"pad_loop ABORT: ImportError on 'inputs' ({e}). "
+                       f"Run: pip install inputs")
             return
+        hotkey_log(f"pad_loop start: 'inputs' loaded; watching {self._pad_targets!r}; "
+                   f"devices.gamepads={len(getattr(_inputs.devices, 'gamepads', []))}")
         active: dict[str, bool] = {}
         warned_no_pad = False
         print(f"[hotkey] gamepad listener watching: {self._pad_targets}", file=sys.stderr)
@@ -248,13 +260,17 @@ class HotkeyManager(QObject):
             except _inputs.UnpluggedError:
                 if not warned_no_pad:
                     print("[hotkey] no gamepad detected; will keep watching", file=sys.stderr)
+                    hotkey_log("pad_loop: UnpluggedError (no gamepad detected yet)")
                     warned_no_pad = True
                 self._pad_stop.wait(2.0)
                 continue
             except Exception as e:
                 print(f"[hotkey] gamepad read error: {type(e).__name__}: {e}", file=sys.stderr)
+                hotkey_log(f"pad_loop: read error {type(e).__name__}: {e}")
                 self._pad_stop.wait(2.0)
                 continue
+            if warned_no_pad:
+                hotkey_log("pad_loop: gamepad now responding")
             warned_no_pad = False
             # Rebuild on each batch so set_bindings() applies live without a thread restart.
             wanted: dict[tuple, list[tuple]] = {}
@@ -274,9 +290,13 @@ class HotkeyManager(QObject):
                         is_pressed = ev.state == 1
                     was = active.get(pad_name, False)
                     if is_pressed and not was:
+                        hotkey_log(f"pad press: {pad_name} "
+                                   f"(ev={ev.ev_type}/{ev.code} state={ev.state})")
                         active[pad_name] = True
                         self._add_down(("pad", pad_name))
                     elif not is_pressed and was:
+                        hotkey_log(f"pad release: {pad_name} "
+                                   f"(ev={ev.ev_type}/{ev.code} state={ev.state})")
                         active[pad_name] = False
                         self._remove_down(("pad", pad_name))
 
@@ -285,6 +305,7 @@ class HotkeyManager(QObject):
         if self._pad_thread is not None:
             self._pad_thread.start()
         self._started = True
+        hotkey_log(f"start: kb_listener up, pad_thread={'spawned' if self._pad_thread else 'none'}")
 
     def stop(self):
         self._kb_listener.stop()

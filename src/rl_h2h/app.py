@@ -12,7 +12,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from . import colors
-from .applog import mmr_log
+from .applog import mmr_log, set_hotkey_log_enabled
 from .config import load_config, save_config
 from .hotkey import HotkeyManager, MenuHotkeyListener, capture_next_input, is_rl_focused
 from .mmr import MMR_CATEGORIES, MMRClient, RANKED_PLAYLISTS, append_mmr_history, load_mmr_history
@@ -52,6 +52,8 @@ def main():
 
     cfg = load_config()
     colors.apply_overrides(cfg)
+    # Flip the hotkey diagnostic log before any HotkeyManager logs its bindings.
+    set_hotkey_log_enabled(bool(cfg.get("hotkey_debug_log", False)))
     players_db = load_players()
 
     app = QApplication(sys.argv)
