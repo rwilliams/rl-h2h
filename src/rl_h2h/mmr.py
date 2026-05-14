@@ -78,6 +78,13 @@ MMR_TTL_SECONDS = 600   # local cache freshness — TRN's own TTL is 4 min
 # so this floor only kicks in on fast responses — effectively caps us at 2
 # req/sec without ever burst-blasting. A 6-player roster resolves in ~3s.
 MMR_FETCH_INTERVAL = 0.5
+# Transient failures (curl timeout, 5xx, 429) get retried automatically.
+# Without this, a single 15s timeout used to strand a player as "…" for the
+# whole match — on_initialized only re-enqueues on a new match boundary.
+# Linear backoff (3s, 6s, 9s) keeps the worker free for other players in the
+# same roster batch while giving TRN a moment to recover.
+MMR_MAX_RETRIES = 3
+MMR_RETRY_BACKOFF_S = 3.0
 
 
 def mmr_lookup_handle(primary_id: str, name: str) -> Optional[tuple[str, str]]:
@@ -240,6 +247,10 @@ class MMRClient(QObject):
         self._cache_lock = threading.Lock()
         self._queue: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
         self._inflight: set[str] = set()
+        # Per-key retry counter for transient failures. Cleared on success or
+        # once MMR_MAX_RETRIES is exceeded. Keys stay in _inflight while a
+        # retry is pending so concurrent enqueues dedupe correctly.
+        self._retry_count: dict[str, int] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._worker, daemon=True, name="MMRFetcher",
@@ -352,10 +363,27 @@ class MMRClient(QObject):
                     break
             try:
                 self._fetch_one(key, plat, ident)
+                self._retry_count.pop(key, None)
+                self._inflight.discard(key)
             except Exception as e:
                 mmr_log(f"{key!r} fetch FAILED: {type(e).__name__}: {e}")
-            finally:
-                self._inflight.discard(key)
+                n = self._retry_count.get(key, 0) + 1
+                if n <= MMR_MAX_RETRIES:
+                    self._retry_count[key] = n
+                    delay = MMR_RETRY_BACKOFF_S * n
+                    mmr_log(f"  retry {n}/{MMR_MAX_RETRIES} scheduled in {delay:.1f}s")
+                    # Keep _inflight set so concurrent enqueues from another
+                    # on_initialized batch dedupe instead of double-fetching.
+                    t = threading.Timer(
+                        delay,
+                        lambda k=key, p=plat, i=ident: self._queue.put((k, p, i)),
+                    )
+                    t.daemon = True
+                    t.start()
+                else:
+                    self._retry_count.pop(key, None)
+                    self._inflight.discard(key)
+                    mmr_log(f"  giving up on {key!r} after {MMR_MAX_RETRIES} retries")
             last_request = time.monotonic()
 
     def _fetch_one(self, key: str, plat: str, ident: str) -> None:
@@ -382,6 +410,10 @@ class MMRClient(QObject):
             return
         if r.status_code != 200:
             mmr_log(f"  {key!r} HTTP {r.status_code}: {r.text[:200]!r}")
+            # Server-side hiccups (TRN overloaded, Cloudflare rate-limit) are
+            # often transient — raise so the worker retries with backoff.
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"HTTP {r.status_code}")
             return
         try:
             payload = r.json()

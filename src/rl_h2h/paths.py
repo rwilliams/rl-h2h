@@ -30,6 +30,7 @@ MMR_HISTORY_PATH = DATA_DIR / "mmr_history.jsonl"
 MMR_LOG_PATH = LOG_DIR / "mmr.log"
 MY_MMR_LOG_PATH = LOG_DIR / "my_mmr.log"
 API_DUMP_PATH = LOG_DIR / "api_dump.log"
+HOTKEY_LOG_PATH = LOG_DIR / "hotkey.log"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
