@@ -263,6 +263,10 @@ class HotkeyManager(QObject):
                     hotkey_log("pad_loop: UnpluggedError (no gamepad detected yet)")
                     warned_no_pad = True
                 self._pad_stop.wait(2.0)
+                # Re-scan for newly connected gamepads without reinitialising the
+                # codes table (devices.__init__() exhausts the type_codes generator).
+                _inputs.devices.gamepads.clear()
+                _inputs.devices._post_init()
                 continue
             except Exception as e:
                 print(f"[hotkey] gamepad read error: {type(e).__name__}: {e}", file=sys.stderr)
